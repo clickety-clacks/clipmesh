@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace --all-targets
+      - run: scripts/check-repository-boundary.sh

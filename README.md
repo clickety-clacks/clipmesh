@@ -16,5 +16,5 @@ architecture, security model, scope, and unresolved decisions.
 
 ## Status
 
-Initial product definition. No implementation has landed yet.
-
+The Rust protocol-v1 foundation is present. Hub, desktop, mobile, enrollment,
+deployment, and private topology remain outside this repository slice.
