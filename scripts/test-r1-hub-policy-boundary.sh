@@ -8,14 +8,15 @@ check="$repo_root/scripts/check-r1-hub-policy-boundary.sh"
 
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
-mkdir -p "$tmp_root/crates/clipmesh-hub-core/src"
-cp "$check" "$tmp_root/check.sh"
-cp "$repo_root/crates/clipmesh-hub-core/Cargo.toml" "$tmp_root/crates/clipmesh-hub-core/Cargo.toml"
-cp "$repo_root/crates/clipmesh-hub-core/src/lib.rs" "$tmp_root/crates/clipmesh-hub-core/src/lib.rs"
-sed -i "s#repo_root=.*#repo_root=\"$tmp_root\"#" "$tmp_root/check.sh"
-printf '\npub struct AdministratorCredential;\n' >> "$tmp_root/crates/clipmesh-hub-core/src/lib.rs"
 
-if "$tmp_root/check.sh" >/dev/null 2>&1; then
-  echo "seeded obsolete surface passed the R1 boundary check" >&2
+(cd "$repo_root" && git ls-files -z | tar --null --files-from=- -cf -) | tar -xf - -C "$tmp_root"
+git -C "$tmp_root" init -q
+git -C "$tmp_root" add .
+mkdir -p "$tmp_root/crates/seeded-current-scope/src"
+printf 'pub struct AdministratorCredential;\n' > "$tmp_root/crates/seeded-current-scope/src/lib.rs"
+git -C "$tmp_root" add crates/seeded-current-scope/src/lib.rs
+
+if "$tmp_root/scripts/check-r1-hub-policy-boundary.sh" >/dev/null 2>&1; then
+  echo "seeded obsolete surface outside the hub crate passed the current-tree census" >&2
   exit 1
 fi

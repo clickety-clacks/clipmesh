@@ -83,6 +83,13 @@ impl StablePeerId {
     fn storage_value(&self) -> &str {
         &self.0
     }
+
+    /// Returns the transport-boundary value for protocol serialization.
+    ///
+    /// Callers must not include this value in diagnostics.
+    pub fn as_boundary_value(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for StablePeerId {
@@ -100,12 +107,18 @@ impl fmt::Display for StablePeerId {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ClipContentV1(Vec<u8>);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct WireContentV1 {
     pub content_type: &'static str,
     pub payload_b64: String,
     pub payload_bytes: usize,
     pub content_sha256: String,
+}
+
+impl fmt::Debug for WireContentV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WireContentV1([redacted])")
+    }
 }
 
 impl ClipContentV1 {
@@ -324,6 +337,23 @@ pub struct ResumePlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeStarted {
+    pub status: ResumeStatus,
+    pub history_epoch: Uuid,
+    pub clear_generation: u64,
+    pub requested_after_cursor: Option<u64>,
+    pub boundary_cursor: Option<u64>,
+    pub lost_through_cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeComplete {
+    pub history_epoch: Uuid,
+    pub clear_generation: u64,
+    pub boundary_cursor: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClearAccepted {
     pub request_id: Uuid,
     pub clear_generation: u64,
@@ -332,9 +362,22 @@ pub struct ClearAccepted {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SessionOutput {
+pub struct ClearNotice {
+    pub request_id: Uuid,
+    pub clear_generation: u64,
+    pub cleared_through_cursor: Option<u64>,
+}
+
+/// Complete transport-neutral events ready for a session writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionEvent {
+    ResumeStarted(ResumeStarted),
+    ResumeClip(RetainedClip),
+    ResumeComplete(ResumeComplete),
     PublishAccepted(PublishAccepted),
     Live(RetainedClip),
+    ClearAccepted(ClearAccepted),
+    ClearNotice(ClearNotice),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,7 +393,7 @@ struct Session {
     peer_id: StablePeerId,
     clear_generation: u64,
     phase: SessionPhase,
-    queue: VecDeque<SessionOutput>,
+    queue: VecDeque<SessionEvent>,
     buffered: Vec<RetainedClip>,
     highest_offered_cursor: Option<u64>,
     acknowledged_cursor: Option<u64>,
@@ -512,11 +555,7 @@ impl HubCore {
         let clips = load_clips(&state.connection, effective_after, boundary, now_ms)?;
         let highest = clips.last().map(|clip| clip.cursor).or(effective_after);
         let clear_generation = state.clear_generation;
-        let session = state.sessions.get_mut(&session_id).expect("session exists");
-        session.phase = SessionPhase::Replaying;
-        session.clear_generation = clear_generation;
-        session.highest_offered_cursor = highest;
-        Ok(ResumePlan {
+        let plan = ResumePlan {
             status,
             history_epoch: state.history_epoch,
             clear_generation: state.clear_generation,
@@ -524,7 +563,32 @@ impl HubCore {
             boundary_cursor: boundary,
             lost_through_cursor: state.lost_through_cursor,
             clips,
-        })
+        };
+        let session = state.sessions.get_mut(&session_id).expect("session exists");
+        session.phase = SessionPhase::Replaying;
+        session.clear_generation = clear_generation;
+        session.highest_offered_cursor = highest;
+        session
+            .queue
+            .push_back(SessionEvent::ResumeStarted(ResumeStarted {
+                status: plan.status,
+                history_epoch: plan.history_epoch,
+                clear_generation: plan.clear_generation,
+                requested_after_cursor: plan.requested_after_cursor,
+                boundary_cursor: plan.boundary_cursor,
+                lost_through_cursor: plan.lost_through_cursor,
+            }));
+        session
+            .queue
+            .extend(plan.clips.iter().cloned().map(SessionEvent::ResumeClip));
+        session
+            .queue
+            .push_back(SessionEvent::ResumeComplete(ResumeComplete {
+                history_epoch: plan.history_epoch,
+                clear_generation: plan.clear_generation,
+                boundary_cursor: plan.boundary_cursor,
+            }));
+        Ok(plan)
     }
 
     pub fn complete_resume(&self, session_id: Uuid) -> Result<(), CoreError> {
@@ -539,10 +603,20 @@ impl HubCore {
         }
         for clip in session.buffered.drain(..) {
             session.highest_offered_cursor = Some(clip.cursor);
-            session.queue.push_back(SessionOutput::Live(clip));
+            session.queue.push_back(SessionEvent::Live(clip));
         }
         session.phase = SessionPhase::Live;
         Ok(())
+    }
+
+    /// Drains complete events while holding the same seam used by mutations.
+    pub fn drain_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEvent>, CoreError> {
+        let mut state = self.state.lock().expect("hub state lock poisoned");
+        let session = state
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(CoreError::Failure(FailureCode::SessionContextStale))?;
+        Ok(session.queue.drain(..).collect())
     }
 
     pub fn publish(
@@ -626,6 +700,12 @@ impl HubCore {
         )
     }
 
+    /// Runs the retention work that the hub scheduler invokes every 60 seconds while ready.
+    pub fn run_periodic_retention(&self, now_ms: i64) -> Result<(), CoreError> {
+        let mut state = self.state.lock().expect("hub state lock poisoned");
+        apply_retention(&mut state, self.limits, now_ms)
+    }
+
     pub fn acknowledge(
         &self,
         session_id: Uuid,
@@ -667,12 +747,14 @@ impl HubCore {
             if receipt.0 != expected_clear_generation {
                 return Err(CoreError::Failure(FailureCode::RequestIdConflict));
             }
-            return Ok(ClearAccepted {
+            let accepted = ClearAccepted {
                 request_id,
                 clear_generation: receipt.1,
                 cleared_through_cursor: receipt.2,
                 duplicate: true,
-            });
+            };
+            enqueue_clear_acceptance(&mut state, session_id, accepted.clone());
+            return Ok(accepted);
         }
         compare_generation(expected_clear_generation, state.clear_generation)?;
         require_live_session(&state, session_id)?;
@@ -702,22 +784,44 @@ impl HubCore {
         tx.commit().map_err(storage_error)?;
         state.clear_generation = next_generation;
         state.lost_through_cursor = cleared_through_cursor;
-        for session in state.sessions.values_mut() {
-            session.queue.retain(|output| match output {
-                SessionOutput::PublishAccepted(_) => true,
-                SessionOutput::Live(clip) => clip.clear_generation >= next_generation,
-            });
-            session
-                .buffered
-                .retain(|clip| clip.clear_generation >= next_generation);
-            session.phase = SessionPhase::Stale;
-        }
-        Ok(ClearAccepted {
+        let accepted = ClearAccepted {
             request_id,
             clear_generation: next_generation,
             cleared_through_cursor,
             duplicate: false,
-        })
+        };
+        let notice = ClearNotice {
+            request_id,
+            clear_generation: next_generation,
+            cleared_through_cursor,
+        };
+        for (current_session_id, session) in &mut state.sessions {
+            session.queue.retain(|output| match output {
+                SessionEvent::ResumeStarted(started) => started.clear_generation >= next_generation,
+                SessionEvent::ResumeClip(clip) | SessionEvent::Live(clip) => {
+                    clip.clear_generation >= next_generation
+                }
+                SessionEvent::ResumeComplete(complete) => {
+                    complete.clear_generation >= next_generation
+                }
+                SessionEvent::PublishAccepted(_)
+                | SessionEvent::ClearAccepted(_)
+                | SessionEvent::ClearNotice(_) => true,
+            });
+            session
+                .buffered
+                .retain(|clip| clip.clear_generation >= next_generation);
+            if *current_session_id == session_id {
+                session
+                    .queue
+                    .push_back(SessionEvent::ClearAccepted(accepted.clone()));
+            }
+            session
+                .queue
+                .push_back(SessionEvent::ClearNotice(notice.clone()));
+            session.phase = SessionPhase::Stale;
+        }
+        Ok(accepted)
     }
 }
 
@@ -1129,7 +1233,15 @@ fn enqueue_acceptance(state: &mut State, source_session_id: Uuid, accepted: Publ
     if let Some(session) = state.sessions.get_mut(&source_session_id) {
         session
             .queue
-            .push_back(SessionOutput::PublishAccepted(accepted));
+            .push_back(SessionEvent::PublishAccepted(accepted));
+    }
+}
+
+fn enqueue_clear_acceptance(state: &mut State, session_id: Uuid, accepted: ClearAccepted) {
+    if let Some(session) = state.sessions.get_mut(&session_id) {
+        session
+            .queue
+            .push_back(SessionEvent::ClearAccepted(accepted));
     }
 }
 
@@ -1148,7 +1260,7 @@ fn enqueue_clip(
             SessionPhase::Replaying => session.buffered.push(clip.clone()),
             SessionPhase::Live => {
                 session.highest_offered_cursor = Some(clip.cursor);
-                session.queue.push_back(SessionOutput::Live(clip.clone()));
+                session.queue.push_back(SessionEvent::Live(clip.clone()));
             }
             SessionPhase::AwaitResume | SessionPhase::Stale => {}
         }
@@ -1249,6 +1361,7 @@ mod tests {
         assert_eq!(stored.to_preview(4), "a� b");
         assert!(stored.same_content(&original));
         assert_eq!(format!("{stored:?}"), "ClipContentV1([redacted])");
+        assert_eq!(format!("{wire:?}"), "WireContentV1([redacted])");
         assert!(!format!("{:?}", peer("peer-secret")).contains("peer-secret"));
     }
 
@@ -1454,8 +1567,13 @@ mod tests {
             .queue
             .iter()
             .filter_map(|output| match output {
-                SessionOutput::Live(clip) => Some(clip.cursor),
-                SessionOutput::PublishAccepted(_) => None,
+                SessionEvent::Live(clip) => Some(clip.cursor),
+                SessionEvent::ResumeStarted(_)
+                | SessionEvent::ResumeClip(_)
+                | SessionEvent::ResumeComplete(_)
+                | SessionEvent::PublishAccepted(_)
+                | SessionEvent::ClearAccepted(_)
+                | SessionEvent::ClearNotice(_) => None,
             })
             .collect();
         assert_eq!(cursors, vec![2, 3]);
@@ -1485,7 +1603,24 @@ mod tests {
             .all(|session| session
                 .queue
                 .iter()
-                .all(|output| !matches!(output, SessionOutput::Live(_)))));
+                .all(|output| !matches!(output, SessionEvent::Live(_)))));
+        let left_events = core.drain_session_events(left.session_id).unwrap();
+        assert!(left_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ClearNotice(notice)
+                if notice.request_id == request_id && notice.clear_generation == 2
+        )));
+        let right_events = core.drain_session_events(right.session_id).unwrap();
+        assert!(right_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ClearAccepted(accepted)
+                if accepted.request_id == request_id && accepted.clear_generation == 2
+        )));
+        assert!(right_events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ClearNotice(notice)
+                if notice.request_id == request_id && notice.clear_generation == 2
+        )));
         let retry_session = live(&core, "peer-left");
         let duplicate = core
             .clear_history(retry_session.session_id, request_id, 1)
@@ -1520,6 +1655,31 @@ mod tests {
             Err(CoreError::Failure(FailureCode::ClearGenerationStale))
         )));
         assert_eq!(core.clear_generation(), 2);
+    }
+
+    #[test]
+    fn periodic_retention_entry_deletes_expired_rows_without_an_operation_trigger() {
+        let limits = RetentionLimits {
+            retention_seconds: 60,
+            ..RetentionLimits::default()
+        };
+        let (_directory, core) = core(limits);
+        let source = live(&core, "peer-periodic-retention");
+        core.publish(
+            source.session_id,
+            publish_input(Uuid::new_v4(), 1, "expires"),
+            NOW,
+        )
+        .unwrap();
+        core.run_periodic_retention(NOW + 60_000).unwrap();
+        let retained: u64 = core
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, 0);
     }
 
     #[test]
