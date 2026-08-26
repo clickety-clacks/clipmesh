@@ -16,5 +16,6 @@ architecture, security model, scope, and unresolved decisions.
 
 ## Status
 
-The Rust protocol-v1 foundation is present. Hub, desktop, mobile, enrollment,
-deployment, and private topology remain outside this repository slice.
+The Rust protocol-v1 foundation and transport-free hub state core are present.
+Hub transport, desktop, mobile, deployment, live enrollment, and private
+topology remain outside this repository slice.
