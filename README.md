@@ -11,11 +11,15 @@ pasteboard.
 Rust is the default implementation language for the hub, protocol, and desktop
 agents. The Apple mobile client uses SwiftUI and native platform APIs.
 
-See [the initial spirit document](docs/initial-spirit.md) for the product intent,
-architecture, security model, scope, and unresolved decisions.
+See [the product intent](docs/initial-spirit.md) for the accepted MVP policy and
+its canonical reviewed specification reference.
 
 ## Status
 
-The Rust protocol-v1 foundation and transport-free hub state core are present.
-Hub transport, desktop, mobile, deployment, live enrollment, and private
-topology remain outside this repository slice.
+The immutable Rust protocol foundation and the remediated transport-neutral hub
+policy core are present. The hub core accepts a stable peer ID from a later
+Tailnet edge and provides SQLite-only ordering, retry, resume, acknowledgement,
+retention, shared clear, and canonical clip-content custody.
+
+LocalAPI, transport, desktop, mobile, packaging, deployment, listeners, and
+private topology remain outside this repository slice.

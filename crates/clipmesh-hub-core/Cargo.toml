@@ -7,10 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
-clipmesh-protocol = { path = "../clipmesh-protocol" }
-getrandom = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
-serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
