@@ -16,15 +16,21 @@ fail() {
 require_clean_match_free() {
   local expression="$1"
   local description="$2"
-  if git grep -l -E -- "$expression" -- . ":!$SCANNER_PATH" >/dev/null; then
-    fail "$description in tracked bytes"
-  fi
-  if git diff --cached -- . ":!$SCANNER_PATH" | grep -E -- "$expression" >/dev/null; then
-    fail "$description in staged diff"
-  fi
-  if git log -p HEAD --format= -- . ":(exclude)$SCANNER_PATH" | grep -E -- "$expression" >/dev/null; then
-    fail "$description in reachable Git history"
-  fi
+  local path commit
+  while IFS= read -r path; do
+    [[ -z "$path" ]] || fail "$description in tracked bytes path $path"
+  done < <(git grep -l -E -- "$expression" -- . ":!$SCANNER_PATH" || true)
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    if git show ":$path" 2>/dev/null | grep -E -- "$expression" >/dev/null; then
+      fail "$description in staged bytes path $path"
+    fi
+  done < <(git diff --cached --name-only --diff-filter=AM -- . ":!$SCANNER_PATH")
+  while IFS= read -r commit; do
+    path=$(git grep -l -E -e "$expression" "$commit" -- . ":!$SCANNER_PATH" | head -n 1 || true)
+    path="${path#"$commit:"}"
+    [[ -z "$path" ]] || fail "$description in reachable Git history commit $commit path $path"
+  done < <(git rev-list HEAD -- . ":(exclude)$SCANNER_PATH")
 }
 
 test -f LICENSE || fail 'missing MIT license'
@@ -42,20 +48,39 @@ require_clean_match_free '(^|[^0-9])0\.0\.0\.0(:[0-9]+)?([^0-9]|$)' 'active wild
 require_clean_match_free 'CLIPMESH_[A-Z0-9_]*(CONTENT|PAYLOAD)[A-Z0-9_]*CANARY[A-Z0-9_]*' 'clipboard content canary'
 require_clean_match_free '(secret|token|password|credential)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_+/=-]{40,}' 'high-entropy secret assignment'
 
-require_no_non_reserved_network_name() {
-  local allowed='example\.invalid|github\.com/clickety-clacks/clipmesh|github\.com/actions|github\.com/dtolnay|github\.com/rust-lang/crates\.io-index'
-  if git grep -h -E 'https?://[^/[:space:]]+' -- . ":!$SCANNER_PATH" | grep -Ev "$allowed" >/dev/null; then
-    fail 'non-reserved network name in tracked bytes'
-  fi
-  if git diff --cached -- . ":!$SCANNER_PATH" | grep -E 'https?://[^/[:space:]]+' | grep -Ev "$allowed" >/dev/null; then
-    fail 'non-reserved network name in staged diff'
-  fi
-  if git log -p HEAD --format= -- . ":(exclude)$SCANNER_PATH" | grep -E 'https?://[^/[:space:]]+' | grep -Ev "$allowed" >/dev/null; then
-    fail 'non-reserved network name in reachable Git history'
-  fi
+is_reserved_network_host() {
+  case "$1" in
+    github.com|example.invalid|*.example.invalid) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
-require_no_non_reserved_network_name
+require_reserved_network_hosts() {
+  local path commit host
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    while IFS= read -r host; do
+      is_reserved_network_host "$host" || fail "non-reserved network name in tracked bytes path $path"
+    done < <(grep -Eo 'https?://[^/[:space:]]+' -- "$path" | sed -E 's|^https?://||; s|[:/?#].*$||')
+  done < <(git grep -l -E 'https?://[^/[:space:]]+' -- . ":!$SCANNER_PATH" || true)
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+    while IFS= read -r host; do
+      is_reserved_network_host "$host" || fail "non-reserved network name in staged bytes path $path"
+    done < <(git show ":$path" 2>/dev/null | grep -Eo 'https?://[^/[:space:]]+' | sed -E 's|^https?://||; s|[:/?#].*$||')
+  done < <(git diff --cached --name-only --diff-filter=AM -- . ":!$SCANNER_PATH")
+  while IFS= read -r commit; do
+    while IFS= read -r path; do
+      path="${path#"$commit:"}"
+      [[ -z "$path" ]] && continue
+      while IFS= read -r host; do
+        is_reserved_network_host "$host" || fail "non-reserved network name in reachable Git history commit $commit path $path"
+      done < <(git show "$commit:$path" | grep -Eo 'https?://[^/[:space:]]+' | sed -E 's|^https?://||; s|[:/?#].*$||')
+    done < <(git grep -l -E 'https?://[^/[:space:]]+' "$commit" -- . ":!$SCANNER_PATH" || true)
+  done < <(git rev-list HEAD -- . ":(exclude)$SCANNER_PATH")
+}
+
+require_reserved_network_hosts
 
 # The exact denylist stays owner-only. A hit identifies only its line and the
 # public path or commit that needs repair; it never writes the private literal.
