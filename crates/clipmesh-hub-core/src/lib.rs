@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt, fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -369,7 +369,7 @@ pub struct ClearNotice {
 }
 
 /// Complete transport-neutral events ready for a session writer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum SessionEvent {
     ResumeStarted(ResumeStarted),
     ResumeClip(RetainedClip),
@@ -406,6 +406,35 @@ struct State {
     cursor_high_water: u64,
     lost_through_cursor: Option<u64>,
     sessions: HashMap<Uuid, Session>,
+}
+
+/// One queued event whose transport handoff remains ordered with hub mutations.
+///
+/// The caller keeps this lease alive until the synchronous handoff completes,
+/// then calls [`SessionEventLease::complete`]. Dropping an incomplete lease
+/// leaves the event queued, so a later shared clear can still retract it.
+pub struct SessionEventLease<'a> {
+    state: MutexGuard<'a, State>,
+    session_id: Uuid,
+}
+
+impl SessionEventLease<'_> {
+    pub fn event(&self) -> &SessionEvent {
+        self.state
+            .sessions
+            .get(&self.session_id)
+            .and_then(|session| session.queue.front())
+            .expect("leased session event remains queued")
+    }
+
+    /// Marks the synchronous handoff complete before releasing the mutation seam.
+    pub fn complete(mut self) {
+        self.state
+            .sessions
+            .get_mut(&self.session_id)
+            .and_then(|session| session.queue.pop_front())
+            .expect("leased session event remains queued");
+    }
 }
 
 pub struct HubCore {
@@ -609,14 +638,20 @@ impl HubCore {
         Ok(())
     }
 
-    /// Drains complete events while holding the same seam used by mutations.
-    pub fn drain_session_events(&self, session_id: Uuid) -> Result<Vec<SessionEvent>, CoreError> {
-        let mut state = self.state.lock().expect("hub state lock poisoned");
+    /// Leases the next event while holding the same seam used by mutations.
+    pub fn lease_next_session_event(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<SessionEventLease<'_>>, CoreError> {
+        let state = self.state.lock().expect("hub state lock poisoned");
         let session = state
             .sessions
-            .get_mut(&session_id)
+            .get(&session_id)
             .ok_or(CoreError::Failure(FailureCode::SessionContextStale))?;
-        Ok(session.queue.drain(..).collect())
+        if session.queue.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(SessionEventLease { state, session_id }))
     }
 
     pub fn publish(
@@ -1344,6 +1379,17 @@ mod tests {
         }
     }
 
+    fn consume_session_events(
+        core: &HubCore,
+        session_id: Uuid,
+        mut inspect: impl FnMut(&SessionEvent),
+    ) {
+        while let Some(lease) = core.lease_next_session_event(session_id).unwrap() {
+            inspect(lease.event());
+            lease.complete();
+        }
+    }
+
     #[test]
     fn content_seam_owns_wire_storage_platform_preview_and_redaction() {
         let original = ClipContentV1::from_platform(b"a\x01\n  b", 64).unwrap();
@@ -1604,23 +1650,31 @@ mod tests {
                 .queue
                 .iter()
                 .all(|output| !matches!(output, SessionEvent::Live(_)))));
-        let left_events = core.drain_session_events(left.session_id).unwrap();
-        assert!(left_events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ClearNotice(notice)
-                if notice.request_id == request_id && notice.clear_generation == 2
-        )));
-        let right_events = core.drain_session_events(right.session_id).unwrap();
-        assert!(right_events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ClearAccepted(accepted)
-                if accepted.request_id == request_id && accepted.clear_generation == 2
-        )));
-        assert!(right_events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ClearNotice(notice)
-                if notice.request_id == request_id && notice.clear_generation == 2
-        )));
+        let mut left_saw_notice = false;
+        consume_session_events(&core, left.session_id, |event| {
+            left_saw_notice |= matches!(
+                event,
+                SessionEvent::ClearNotice(notice)
+                    if notice.request_id == request_id && notice.clear_generation == 2
+            );
+        });
+        assert!(left_saw_notice);
+        let mut right_saw_accepted = false;
+        let mut right_saw_notice = false;
+        consume_session_events(&core, right.session_id, |event| {
+            right_saw_accepted |= matches!(
+                event,
+                SessionEvent::ClearAccepted(accepted)
+                    if accepted.request_id == request_id && accepted.clear_generation == 2
+            );
+            right_saw_notice |= matches!(
+                event,
+                SessionEvent::ClearNotice(notice)
+                    if notice.request_id == request_id && notice.clear_generation == 2
+            );
+        });
+        assert!(right_saw_accepted);
+        assert!(right_saw_notice);
         let retry_session = live(&core, "peer-left");
         let duplicate = core
             .clear_history(retry_session.session_id, request_id, 1)
