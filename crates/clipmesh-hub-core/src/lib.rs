@@ -2,13 +2,11 @@
 //!
 //! This crate deliberately has no listener, HTTP, WebSocket, TLS, deployment,
 //! or live-service integration. `HubCore` is the one mutation and recipient
-//! seam: state changes, recipient selection, queue cutoff, and the final
-//! eligibility check before a caller hands a frame to a transport all happen
-//! while its single lock is held.
+//! seam for state changes, recipient selection, and queue cutoff. The TLS-owning
+//! integration slice must extend this seam through its concrete frame handoff.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::Write,
     path::Path,
     sync::Mutex,
 };
@@ -177,7 +175,6 @@ pub struct PurgeResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AcceptedPublish {
-    message_id: Uuid,
     pub cursor: u64,
     pub expires_at_ms: i64,
     pub duplicate: bool,
@@ -766,37 +763,6 @@ impl HubCore {
         Ok(())
     }
 
-    /// Writes the next complete protocol frame while the mutation-recipient seam is held.
-    ///
-    /// The writer must be the active session's transport writer. The core does
-    /// not expose the frame or its payload for a caller to send after this method
-    /// returns. Eligibility is checked immediately before `write_all`, and the
-    /// output is removed only when that transport write succeeds.
-    pub fn write_next_output<W: Write + ?Sized>(
-        &self,
-        session_id: Uuid,
-        transport_writer: &mut W,
-    ) -> Result<Option<Result<(), std::io::Error>>, CoreError> {
-        let mut state = self.state.lock().expect("hub state lock poisoned");
-        let history_epoch = state.history_epoch;
-        let session = state
-            .sessions
-            .get_mut(&session_id)
-            .ok_or(CoreError::Failure(FailureCode::Unauthorized))?;
-        if session.phase != SessionPhase::Live || session.history_epoch != history_epoch {
-            return Err(CoreError::Failure(FailureCode::SessionEpochStale));
-        }
-        let Some(output) = session.queue.front() else {
-            return Ok(None);
-        };
-        let frame = serialize_session_output(output)?;
-        let result = transport_writer.write_all(&frame);
-        if result.is_ok() {
-            session.queue.pop_front();
-        }
-        Ok(Some(result))
-    }
-
     pub fn publish(
         &self,
         session_id: Uuid,
@@ -837,7 +803,6 @@ impl HubCore {
                     &mut state,
                     session_id,
                     AcceptedPublish {
-                        message_id,
                         cursor: retained.cursor,
                         expires_at_ms: retained.event.expires_at_ms,
                         duplicate: true,
@@ -2089,30 +2054,6 @@ fn retention_removals(
     remove
 }
 
-fn serialize_session_output(output: &SessionOutput) -> Result<Vec<u8>, CoreError> {
-    let value = match output {
-        SessionOutput::PublishAccepted(accepted) => serde_json::json!({
-            "type": "publish_accepted",
-            "protocol_version": 1,
-            "message_id": accepted.message_id.to_string(),
-            "cursor": accepted.cursor.to_string(),
-            "expires_at_ms": accepted.expires_at_ms,
-            "duplicate": accepted.duplicate,
-        }),
-        SessionOutput::LiveEvent(queued) => serde_json::json!({
-            "type": "event",
-            "protocol_version": 1,
-            "history_epoch": queued.history_epoch.to_string(),
-            "cursor": queued.event.cursor.to_string(),
-            "delivery": "live",
-            "accepted_at_ms": queued.event.accepted_at_ms,
-            "source_display_name": queued.event.source_display_name,
-            "event": queued.event.event,
-        }),
-    };
-    serde_json::to_vec(&value).map_err(|_| CoreError::DatabaseIntegrityFailed)
-}
-
 fn enqueue_publish_accepted(
     state: &mut State,
     source_session_id: Uuid,
@@ -2140,7 +2081,6 @@ fn enqueue_accepted(
         state,
         source_session_id,
         AcceptedPublish {
-            message_id: event.event.message_id.get(),
             cursor: event.cursor,
             expires_at_ms: event.event.expires_at_ms,
             duplicate: false,
@@ -2195,18 +2135,12 @@ fn parse_uuid_v4(value: &str) -> Result<Uuid, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env, fs,
-        process::Command,
-        sync::{mpsc, Arc},
-        thread,
-        time::Duration,
-    };
+    use std::{env, fs, process::Command, sync::Arc, thread};
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use clipmesh_protocol::{
-        decode_server_message, AdministratorCredential, ClipboardEventV1, DeviceDisplayName,
-        FailureCode, Platform, ResumeStatus,
+        AdministratorCredential, ClipboardEventV1, DeviceDisplayName, FailureCode, Platform,
+        ResumeStatus,
     };
     use rusqlite::Connection;
     use sha2::{Digest, Sha256};
@@ -2321,31 +2255,16 @@ mod tests {
     }
 
     fn take_output(core: &HubCore, session_id: Uuid) -> Result<Option<SessionOutput>, CoreError> {
-        struct ValidatingTransportWriter;
-        impl std::io::Write for ValidatingTransportWriter {
-            fn write(&mut self, frame: &[u8]) -> std::io::Result<usize> {
-                decode_server_message(std::str::from_utf8(frame).unwrap()).unwrap();
-                Ok(frame.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let output = core
-            .state
-            .lock()
-            .unwrap()
+        let mut state = core.state.lock().unwrap();
+        let history_epoch = state.history_epoch;
+        let session = state
             .sessions
-            .get(&session_id)
-            .and_then(|session| session.queue.front().cloned());
-        let handed = core.write_next_output(session_id, &mut ValidatingTransportWriter)?;
-        match handed {
-            None => Ok(None),
-            Some(Ok(())) => Ok(output),
-            Some(Err(error)) => panic!("test transport write failed: {error}"),
+            .get_mut(&session_id)
+            .ok_or(CoreError::Failure(FailureCode::Unauthorized))?;
+        if session.phase != SessionPhase::Live || session.history_epoch != history_epoch {
+            return Err(CoreError::Failure(FailureCode::SessionEpochStale));
         }
+        Ok(session.queue.pop_front())
     }
 
     fn take_live(core: &HubCore, session_id: Uuid) -> Result<Option<QueuedLiveEvent>, CoreError> {
@@ -2872,7 +2791,6 @@ mod tests {
         assert_eq!(
             take_output(&fixture.core, session).unwrap().unwrap(),
             SessionOutput::PublishAccepted(AcceptedPublish {
-                message_id,
                 cursor: 1,
                 expires_at_ms: NOW + 10_000,
                 duplicate: false,
@@ -2890,7 +2808,6 @@ mod tests {
             assert_eq!(
                 take_output(&fixture.core, session).unwrap().unwrap(),
                 SessionOutput::PublishAccepted(AcceptedPublish {
-                    message_id,
                     cursor: 1,
                     expires_at_ms: NOW + 10_000,
                     duplicate: true,
@@ -3368,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn administrative_mutations_cut_off_queues_before_transport_handoff() {
+    fn administrative_mutations_clear_affected_session_queues() {
         let fixture = fixture(HistoryMode::Sqlite, RetentionLimits::default());
         let source = create_device(&fixture.core, &fixture.administrator, "Source", 1);
         let peer = create_device(&fixture.core, &fixture.administrator, "Peer", 2);
@@ -3449,7 +3366,6 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             SessionOutput::PublishAccepted(AcceptedPublish {
-                message_id: second_message_id,
                 cursor: 2,
                 expires_at_ms: NOW + 10_000,
                 duplicate: false,
@@ -3471,138 +3387,6 @@ mod tests {
         assert_eq!(
             fixture.core.open_session(&rotated.credential),
             Err(CoreError::Failure(FailureCode::AdministrativelyPaused))
-        );
-    }
-
-    #[test]
-    fn transport_write_and_administrative_cutoff_share_one_seam() {
-        let fixture = fixture(HistoryMode::Sqlite, RetentionLimits::default());
-        let source = create_device(&fixture.core, &fixture.administrator, "Source", 1);
-        let target = create_device(&fixture.core, &fixture.administrator, "Target", 2);
-        let source_session = live_session(&fixture.core, &source.credential);
-        let target_session = live_session(&fixture.core, &target.credential);
-        fixture
-            .core
-            .publish(
-                source_session,
-                event(
-                    source.record.device_id,
-                    1,
-                    Uuid::new_v4(),
-                    "handoff under seam",
-                    NOW,
-                    NOW + 10_000,
-                ),
-                NOW,
-            )
-            .unwrap();
-
-        let core = Arc::new(fixture.core);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        struct BlockingTransportWriter {
-            entered: mpsc::Sender<()>,
-            release: mpsc::Receiver<()>,
-        }
-        impl std::io::Write for BlockingTransportWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.entered.send(()).unwrap();
-                self.release.recv().unwrap();
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let write_core = Arc::clone(&core);
-        let write = thread::spawn(move || {
-            let mut transport = BlockingTransportWriter {
-                entered: entered_tx,
-                release: release_rx,
-            };
-            write_core
-                .write_next_output(target_session, &mut transport)
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        });
-        entered_rx.recv().unwrap();
-
-        let (cutoff_tx, cutoff_rx) = mpsc::channel();
-        let cutoff_core = Arc::clone(&core);
-        let administrator = fixture.administrator.clone();
-        let cutoff = thread::spawn(move || {
-            let result = cutoff_core.revoke_device(
-                &administrator,
-                request(9),
-                target.record.device_id,
-                NOW + 1,
-            );
-            cutoff_tx.send(result).unwrap();
-        });
-        assert!(cutoff_rx.recv_timeout(Duration::from_millis(100)).is_err());
-        release_tx.send(()).unwrap();
-        write.join().unwrap();
-        assert_eq!(
-            cutoff_rx.recv().unwrap().unwrap().cut_off_sessions,
-            vec![target_session]
-        );
-        cutoff.join().unwrap();
-        assert_eq!(
-            take_output(&core, target_session),
-            Err(CoreError::Failure(FailureCode::Unauthorized))
-        );
-    }
-
-    #[test]
-    fn failed_transport_write_keeps_the_complete_frame_queued() {
-        struct FailingWriter;
-        impl std::io::Write for FailingWriter {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("injected transport failure"))
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let fixture = fixture(HistoryMode::Sqlite, RetentionLimits::default());
-        let source = create_device(&fixture.core, &fixture.administrator, "Source", 1);
-        let target = create_device(&fixture.core, &fixture.administrator, "Target", 2);
-        let source_session = live_session(&fixture.core, &source.credential);
-        let target_session = live_session(&fixture.core, &target.credential);
-        fixture
-            .core
-            .publish(
-                source_session,
-                event(
-                    source.record.device_id,
-                    1,
-                    Uuid::new_v4(),
-                    "retry complete frame",
-                    NOW,
-                    NOW + 10_000,
-                ),
-                NOW,
-            )
-            .unwrap();
-
-        let failed = fixture
-            .core
-            .write_next_output(target_session, &mut FailingWriter)
-            .unwrap()
-            .unwrap();
-        assert_eq!(failed.unwrap_err().kind(), std::io::ErrorKind::Other);
-        assert_eq!(
-            take_live(&fixture.core, target_session)
-                .unwrap()
-                .unwrap()
-                .event
-                .cursor,
-            1
         );
     }
 
