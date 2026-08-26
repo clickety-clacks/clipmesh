@@ -14,6 +14,43 @@ use uuid::{Uuid, Variant, Version};
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_CLOCK_SKEW_MS: i64 = 120_000;
 
+/// The only representable outbound protocol version is the reviewed v1 value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProtocolVersion;
+impl Serialize for ProtocolVersion {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(PROTOCOL_VERSION)
+    }
+}
+impl<'de> Deserialize<'de> for ProtocolVersion {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let version = u8::deserialize(deserializer)?;
+        if version == PROTOCOL_VERSION {
+            Ok(Self)
+        } else {
+            Err(de::Error::custom("unsupported protocol version"))
+        }
+    }
+}
+
+/// The v1 wire limit is fixed; a peer cannot select a weaker clock-skew rule.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FixedClockSkewMs;
+impl Serialize for FixedClockSkewMs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(MAX_CLOCK_SKEW_MS)
+    }
+}
+impl<'de> Deserialize<'de> for FixedClockSkewMs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if i64::deserialize(deserializer)? == MAX_CLOCK_SKEW_MS {
+            Ok(Self)
+        } else {
+            Err(de::Error::custom("max_clock_skew_ms must be 120000"))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct U64Decimal(u64);
 
@@ -196,6 +233,16 @@ macro_rules! credential {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str($marker)
+            }
+        }
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.wire_value())
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                Self::from_wire(&String::deserialize(deserializer)?).map_err(de::Error::custom)
             }
         }
     };
@@ -412,7 +459,7 @@ pub struct LimitsV1 {
     pub max_payload_bytes: u32,
     pub retention_seconds: u64,
     pub history_max_entries: u32,
-    pub max_clock_skew_ms: u32,
+    pub max_clock_skew_ms: FixedClockSkewMs,
     pub max_websocket_message_bytes: u32,
 }
 
@@ -432,19 +479,92 @@ pub enum Delivery {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseScope {
+    Global,
+    Device,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PauseReasonCode;
+impl Serialize for PauseReasonCode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("administratively_paused")
+    }
+}
+impl<'de> Deserialize<'de> for PauseReasonCode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if String::deserialize(deserializer)? == "administratively_paused" {
+            Ok(Self)
+        } else {
+            Err(de::Error::custom(
+                "pause notice reason must be administratively_paused",
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureResponse {
+    code: FailureCode,
+}
+impl FailureResponse {
+    fn non_secret(code: FailureCode) -> Result<Self, &'static str> {
+        if matches!(code, FailureCode::SecretResultAlreadyCommitted) {
+            return Err("secret_result_already_committed requires a resource ID");
+        }
+        Ok(Self { code })
+    }
+    pub fn code(&self) -> &FailureCode {
+        &self.code
+    }
+}
+impl Serialize for FailureResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            code: &'a FailureCode,
+            retryable: bool,
+        }
+        Wire {
+            code: &self.code,
+            retryable: self.code.retryable(),
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for FailureResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            code: FailureCode,
+            retryable: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.retryable != wire.code.retryable() {
+            return Err(de::Error::custom(
+                "retryable must match the stable failure code",
+            ));
+        }
+        Self::non_secret(wire.code).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessageV1 {
     Resume {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         known_history_epoch: Option<UuidV4>,
         after_cursor: Option<U64Decimal>,
     },
     Publish {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         event: ClipboardEventV1,
     },
     Ack {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         history_epoch: UuidV4,
         cursor: U64Decimal,
     },
@@ -454,7 +574,7 @@ pub enum ClientMessageV1 {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ServerMessageV1 {
     ServerHello {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         session_id: UuidV4,
         device_id: UuidV4,
         device_display_name: DeviceDisplayName,
@@ -464,7 +584,7 @@ pub enum ServerMessageV1 {
         limits: LimitsV1,
     },
     ResumeStarted {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         history_epoch: UuidV4,
         status: ResumeStatus,
         requested_after_cursor: Option<U64Decimal>,
@@ -472,7 +592,7 @@ pub enum ServerMessageV1 {
         lost_through_cursor: Option<U64Decimal>,
     },
     Event {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         history_epoch: UuidV4,
         cursor: U64Decimal,
         delivery: Delivery,
@@ -481,44 +601,364 @@ pub enum ServerMessageV1 {
         event: ClipboardEventV1,
     },
     ResumeComplete {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         history_epoch: UuidV4,
         boundary_cursor: Option<U64Decimal>,
     },
     PublishAccepted {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         message_id: UuidV4,
         cursor: U64Decimal,
         expires_at_ms: i64,
         duplicate: bool,
     },
     PublishRejected {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         message_id: Option<UuidV4>,
-        code: FailureCode,
-        retryable: bool,
+        #[serde(flatten)]
+        failure: FailureResponse,
     },
     PauseNotice {
-        protocol_version: u8,
-        scope: String,
-        reason_code: FailureCode,
+        protocol_version: ProtocolVersion,
+        scope: PauseScope,
+        reason_code: PauseReasonCode,
     },
     PurgeNotice {
-        protocol_version: u8,
+        protocol_version: ProtocolVersion,
         purge_id: UuidV4,
         history_epoch: UuidV4,
         purged_through_cursor: Option<U64Decimal>,
     },
     Error {
-        protocol_version: u8,
-        code: FailureCode,
-        retryable: bool,
+        protocol_version: ProtocolVersion,
+        #[serde(flatten)]
+        failure: FailureResponse,
     },
+}
+
+/// Control-plane schemas are path-selected: each named request maps to exactly
+/// one HTTPS endpoint in Architecture 6.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPlatform {
+    LinuxWayland,
+    Macos,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobilePlatform {
+    Ios,
+    Ipados,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceState {
+    Active,
+    Pending,
+    Revoked,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InitialCredentialGeneration;
+impl Serialize for InitialCredentialGeneration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(1)
+    }
+}
+impl<'de> Deserialize<'de> for InitialCredentialGeneration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if u64::deserialize(deserializer)? == 1 {
+            Ok(Self)
+        } else {
+            Err(de::Error::custom("initial credential generation must be 1"))
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CredentialGeneration(u64);
+impl CredentialGeneration {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+impl Serialize for CredentialGeneration {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.0)
+    }
+}
+impl<'de> Deserialize<'de> for CredentialGeneration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u64::deserialize(deserializer)?;
+        if value == 0 {
+            Err(de::Error::custom("credential generation must be positive"))
+        } else {
+            Ok(Self(value))
+        }
+    }
+}
+
+macro_rules! fixed_device_state {
+    ($name:ident, $wire:literal) => {
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct $name;
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str($wire)
+            }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                if String::deserialize(deserializer)? == $wire {
+                    Ok(Self)
+                } else {
+                    Err(de::Error::custom(concat!("device state must be ", $wire)))
+                }
+            }
+        }
+    };
+}
+fixed_device_state!(ActiveDeviceState, "active");
+fixed_device_state!(PendingDeviceState, "pending");
+fixed_device_state!(RevokedDeviceState, "revoked");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseState {
+    scope: PauseScope,
+    device_id: Option<UuidV4>,
+    paused: bool,
+}
+impl PauseState {
+    pub fn global(paused: bool) -> Self {
+        Self {
+            scope: PauseScope::Global,
+            device_id: None,
+            paused,
+        }
+    }
+    pub fn device(device_id: UuidV4, paused: bool) -> Self {
+        Self {
+            scope: PauseScope::Device,
+            device_id: Some(device_id),
+            paused,
+        }
+    }
+}
+impl Serialize for PauseState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            scope: &'a PauseScope,
+            device_id: &'a Option<UuidV4>,
+            paused: bool,
+        }
+        Wire {
+            scope: &self.scope,
+            device_id: &self.device_id,
+            paused: self.paused,
+        }
+        .serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for PauseState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            scope: PauseScope,
+            device_id: Option<UuidV4>,
+            paused: bool,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        match (wire.scope, wire.device_id) {
+            (PauseScope::Global, None) => Ok(Self::global(wire.paused)),
+            (PauseScope::Device, Some(device_id)) => Ok(Self::device(device_id, wire.paused)),
+            _ => Err(de::Error::custom("pause scope and device_id disagree")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateManagedDeviceRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+    pub display_name: DeviceDisplayName,
+    pub platform: ManagedPlatform,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateEnrollmentArtifactRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+    pub display_name: DeviceDisplayName,
+    pub platform: MobilePlatform,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateCredentialRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevokeDeviceRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PurgeHistoryRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetPauseStateRequestV1 {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: UuidV4,
+    #[serde(flatten)]
+    pub pause_state: PauseState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ControlSuccessV1 {
+    DeviceCreated {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        device_id: UuidV4,
+        credential: DeviceCredential,
+        credential_generation: InitialCredentialGeneration,
+        device_state: ActiveDeviceState,
+        created_at_ms: i64,
+    },
+    EnrollmentArtifactCreated {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        device_id: UuidV4,
+        enrollment_artifact: EnrollmentArtifact,
+        expires_at_ms: i64,
+        device_state: PendingDeviceState,
+    },
+    DeviceEnrolled {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        device_id: UuidV4,
+        credential: DeviceCredential,
+        credential_generation: InitialCredentialGeneration,
+        device_state: ActiveDeviceState,
+        enrolled_at_ms: i64,
+    },
+    CredentialRotated {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        device_id: UuidV4,
+        credential: DeviceCredential,
+        credential_generation: CredentialGeneration,
+        rotated_at_ms: i64,
+    },
+    DeviceRevoked {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        device_id: UuidV4,
+        device_state: RevokedDeviceState,
+        revoked_at_ms: i64,
+    },
+    PauseStateSet {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        #[serde(flatten)]
+        pause_state: PauseState,
+        changed_at_ms: i64,
+    },
+    HistoryPurged {
+        protocol_version: ProtocolVersion,
+        request_id: UuidV4,
+        purge_id: UuidV4,
+        history_epoch: UuidV4,
+        purged_through_cursor: Option<U64Decimal>,
+        purged_at_ms: i64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlError {
+    Failure(FailureResponse),
+    SecretResultAlreadyCommitted { resource_id: UuidV4 },
+}
+impl Serialize for ControlError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            code: &'a FailureCode,
+            retryable: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            resource_id: Option<&'a UuidV4>,
+        }
+        match self {
+            Self::Failure(failure) => Wire {
+                code: failure.code(),
+                retryable: failure.code().retryable(),
+                resource_id: None,
+            }
+            .serialize(serializer),
+            Self::SecretResultAlreadyCommitted { resource_id } => Wire {
+                code: &FailureCode::SecretResultAlreadyCommitted,
+                retryable: false,
+                resource_id: Some(resource_id),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ControlError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            code: FailureCode,
+            retryable: bool,
+            resource_id: Option<UuidV4>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.retryable != wire.code.retryable() {
+            return Err(de::Error::custom(
+                "retryable must match the stable failure code",
+            ));
+        }
+        match (wire.code, wire.resource_id) {
+            (FailureCode::SecretResultAlreadyCommitted, Some(resource_id)) => {
+                Ok(Self::SecretResultAlreadyCommitted { resource_id })
+            }
+            (FailureCode::SecretResultAlreadyCommitted, None) => Err(de::Error::custom(
+                "secret_result_already_committed requires resource_id",
+            )),
+            (_, Some(_)) => Err(de::Error::custom(
+                "resource_id is only allowed for secret_result_already_committed",
+            )),
+            (code, None) => FailureResponse::non_secret(code)
+                .map(Self::Failure)
+                .map_err(de::Error::custom),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlErrorResponseV1 {
+    pub protocol_version: ProtocolVersion,
+    pub error: ControlError,
 }
 
 #[derive(Deserialize)]
 struct VersionEnvelope {
-    protocol_version: u8,
+    protocol_version: serde_json::Value,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -532,7 +972,15 @@ pub enum DecodeError {
 fn ensure_v1(text: &str) -> Result<(), DecodeError> {
     let envelope: VersionEnvelope =
         serde_json::from_str(text).map_err(|_| DecodeError::ProtocolSchemaInvalid)?;
-    if envelope.protocol_version != PROTOCOL_VERSION {
+    let serde_json::Value::Number(number) = envelope.protocol_version else {
+        return Err(DecodeError::ProtocolSchemaInvalid);
+    };
+    let integer = number.to_string();
+    let digits = integer.strip_prefix('-').unwrap_or(&integer);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(DecodeError::ProtocolSchemaInvalid);
+    }
+    if integer != PROTOCOL_VERSION.to_string() {
         return Err(DecodeError::ProtocolVersionUnsupported);
     }
     Ok(())
@@ -566,7 +1014,7 @@ mod tests {
         else {
             panic!("fixture must publish");
         };
-        assert_eq!(*protocol_version, 1);
+        assert_eq!(*protocol_version, ProtocolVersion);
         event.validate(1_700_000_000_000, 262_144, 14_400).unwrap();
         let fixture_value: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
         assert_eq!(serde_json::to_value(message).unwrap(), fixture_value);
@@ -578,6 +1026,14 @@ mod tests {
             decode_client_message(r#"{"protocol_version":2,"type":"publish","event":"wrong"}"#),
             Err(DecodeError::ProtocolVersionUnsupported)
         );
+        for version in ["256", "-1", "18446744073709551615", "18446744073709551616"] {
+            assert_matches!(
+                decode_client_message(&format!(
+                    r#"{{"protocol_version":{version},"type":"publish","event":"wrong"}}"#
+                )),
+                Err(DecodeError::ProtocolVersionUnsupported)
+            );
+        }
     }
 
     #[test]
@@ -639,5 +1095,47 @@ mod tests {
             event.validate(1_700_000_000_000, 262_144, 14_400),
             Err(FailureCode::PayloadEncodingInvalid)
         );
+    }
+
+    #[test]
+    fn fixed_protocol_fields_reject_invalid_degrees_of_freedom() {
+        assert_matches!(serde_json::from_str::<FixedClockSkewMs>("0"), Err(_));
+        assert_matches!(
+            decode_server_message(
+                r#"{"protocol_version":1,"type":"pause_notice","scope":"bananas","reason_code":"payload_empty"}"#
+            ),
+            Err(DecodeError::ProtocolSchemaInvalid)
+        );
+        assert_matches!(
+            decode_server_message(
+                r#"{"protocol_version":1,"type":"error","code":"payload_empty","retryable":true}"#
+            ),
+            Err(DecodeError::ProtocolSchemaInvalid)
+        );
+    }
+
+    #[test]
+    fn control_plane_schemas_are_closed_and_platform_specific() {
+        let request = r#"{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","display_name":"Synthetic desktop","platform":"linux_wayland"}"#;
+        assert!(serde_json::from_str::<CreateManagedDeviceRequestV1>(request).is_ok());
+        assert!(serde_json::from_str::<CreateEnrollmentArtifactRequestV1>(request).is_err());
+        assert!(
+            serde_json::from_str::<CreateManagedDeviceRequestV1>(&format!("{request} ")).is_ok()
+        );
+        let invalid_pause = r#"{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","scope":"global","device_id":"00000000-0000-4000-8000-000000000004","paused":true}"#;
+        assert!(serde_json::from_str::<SetPauseStateRequestV1>(invalid_pause).is_err());
+    }
+
+    #[test]
+    fn control_success_and_error_states_are_variant_bound() {
+        let credential = format!("{}{}", "cm_dev_v1_", "A".repeat(43));
+        let invalid_created = format!(
+            r#"{{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","type":"device_created","device_id":"00000000-0000-4000-8000-000000000004","credential":"{credential}","credential_generation":2,"device_state":"pending","created_at_ms":0}}"#
+        );
+        assert!(serde_json::from_str::<ControlSuccessV1>(&invalid_created).is_err());
+        let invalid_revoked = r#"{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","type":"device_revoked","device_id":"00000000-0000-4000-8000-000000000004","device_state":"active","revoked_at_ms":0}"#;
+        assert!(serde_json::from_str::<ControlSuccessV1>(invalid_revoked).is_err());
+        let missing_resource = r#"{"protocol_version":1,"error":{"code":"secret_result_already_committed","retryable":false}}"#;
+        assert!(serde_json::from_str::<ControlErrorResponseV1>(missing_resource).is_err());
     }
 }
