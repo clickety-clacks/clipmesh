@@ -34,9 +34,13 @@ expect_failure() {
     network) printf '%s://%s.%s\n' "$(printf '%s%s' ht tps)" docs example.com > "$target/seed.txt" ;;
     mixed_network) printf '%s://%s.%s %s://hub.%s.example.invalid\n' "$(printf '%s%s' ht tps)" docs example.com "$(printf '%s%s' ht tps)" "$(printf '%s' internal)" > "$target/seed.txt" ;;
     prefixed_network) printf '%s://%s.%s.%s\n' "$(printf '%s%s' ht tps)" example invalid docs.example.com > "$target/seed.txt" ;;
+    mixed_case_private_url) printf '%s://%s.%s\n' "$(printf '%s%s' H TTPS)" "$(printf '%s' HUB)" "$(printf '%s' INTERNAL)" > "$target/seed.txt" ;;
+    staged_mixed_case_network) printf '%s://hub.%s.example.invalid %s://%s.%s\n' "$(printf '%s%s' H TTPS)" "$(printf '%s' EXAMPLE)" "$(printf '%s%s' Ht TpS)" docs example.com > "$target/seed.txt" ;;
   esac
   git -C "$target" add .
-  [[ "$name" != staged_token ]] || printf 'clean fixture\n' > "$target/seed.txt"
+  case "$name" in
+    staged_token|staged_mixed_case_network) printf 'clean fixture\n' > "$target/seed.txt" ;;
+  esac
   local output
   if output=$("$target/scripts/check-repository-boundary.sh" 2>&1); then
     printf 'expected %s seeded failure\n' "$name" >&2
@@ -46,9 +50,12 @@ expect_failure() {
     [[ "$output" == *'staged bytes path seed.txt'* ]] || { printf 'generic result omitted staged path\n' >&2; exit 1; }
     [[ "$output" != *"$secret"* ]] || { printf 'generic result echoed token\n' >&2; exit 1; }
   fi
+  if [[ "$name" == staged_mixed_case_network ]]; then
+    [[ "$output" == *'staged bytes path seed.txt'* ]] || { printf 'mixed-case result omitted staged path\n' >&2; exit 1; }
+  fi
 }
 
-for seed in hostname listener canary entropy license staged_token private_literal network mixed_network prefixed_network; do expect_failure "$seed"; done
+for seed in hostname listener canary entropy license staged_token private_literal network mixed_network prefixed_network mixed_case_private_url staged_mixed_case_network; do expect_failure "$seed"; done
 
 history_target=$(make_repo history)
 history_literal="$(printf '%s.%s.%s.%s' 10 1 2 3)"
@@ -63,6 +70,22 @@ if history_output=$("$history_target/scripts/check-repository-boundary.sh" 2>&1)
 fi
 [[ "$history_output" == *'reachable Git history'* ]] || { printf 'history result omitted its custody surface\n' >&2; exit 1; }
 [[ "$history_output" != *"$history_literal"* ]] || { printf 'history result echoed private literal\n' >&2; exit 1; }
+
+history_url_target=$(make_repo history-url)
+history_url="$(printf '%s://%s.%s %s://%s.%s' "$(printf '%s%s' H TTPS)" hub "$(printf '%s' EXAMPLE)" "$(printf '%s%s' Ht TpS)" docs example.com)"
+printf '%s\n' "$history_url" > "$history_url_target/seed.txt"
+git -C "$history_url_target" add seed.txt
+git -C "$history_url_target" commit -qm mixed-case-network-in-history
+printf 'clean fixture\n' > "$history_url_target/seed.txt"
+git -C "$history_url_target" add seed.txt
+git -C "$history_url_target" commit -qm remove-network
+if history_url_output=$("$history_url_target/scripts/check-repository-boundary.sh" 2>&1); then
+  printf 'expected mixed-case history seeded failure\n' >&2
+  exit 1
+fi
+[[ "$history_url_output" == *'reachable Git history'* ]] || { printf 'mixed-case history result omitted its custody surface\n' >&2; exit 1; }
+[[ "$history_url_output" == *'path seed.txt'* ]] || { printf 'mixed-case history result omitted path\n' >&2; exit 1; }
+[[ "$history_url_output" != *"$history_url"* ]] || { printf 'mixed-case history result echoed URL\n' >&2; exit 1; }
 
 reserved_target=$(make_repo reserved)
 printf '%s://hub.%s.example.invalid\n' "$(printf '%s%s' ht tps)" "$(printf '%s' internal)" > "$reserved_target/seed.txt"

@@ -16,18 +16,21 @@ fail() {
 require_clean_match_free() {
   local expression="$1"
   local description="$2"
+  local case_insensitive="${3:-}"
   local path commit
+  local -a grep_flags=(-E)
+  [[ "$case_insensitive" != case_insensitive ]] || grep_flags+=(-i)
   while IFS= read -r path; do
     [[ -z "$path" ]] || fail "$description in tracked bytes path $path"
-  done < <(git grep -l -E -- "$expression" -- . ":!$SCANNER_PATH" || true)
+  done < <(git grep -l "${grep_flags[@]}" -- "$expression" -- . ":!$SCANNER_PATH" || true)
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
-    if git show ":$path" 2>/dev/null | grep -E -- "$expression" >/dev/null; then
+    if git show ":$path" 2>/dev/null | grep "${grep_flags[@]}" -- "$expression" >/dev/null; then
       fail "$description in staged bytes path $path"
     fi
   done < <(git diff --cached --name-only --diff-filter=AM -- . ":!$SCANNER_PATH")
   while IFS= read -r commit; do
-    path=$(git grep -l -E -e "$expression" "$commit" -- . ":!$SCANNER_PATH" | head -n 1 || true)
+    path=$(git grep -l "${grep_flags[@]}" -e "$expression" "$commit" -- . ":!$SCANNER_PATH" | head -n 1 || true)
     path="${path#"$commit:"}"
     [[ -z "$path" ]] || fail "$description in reachable Git history commit $commit path $path"
   done < <(git rev-list HEAD -- . ":(exclude)$SCANNER_PATH")
@@ -43,10 +46,17 @@ require_clean_match_free '-----BEGIN( [A-Z]+)? PRIVATE KEY-----' 'private key'
 require_clean_match_free '[Aa]uthorization:[[:space:]]*Bearer[[:space:]]+[^[:space:]]+' 'authorization header'
 require_clean_match_free 'gh[pousr]_[A-Za-z0-9_]{20,}' 'known token'
 require_clean_match_free '(10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3})' 'private network literal'
-require_clean_match_free '([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9.-]|$)' 'private service hostname'
 require_clean_match_free '(^|[^0-9])0\.0\.0\.0(:[0-9]+)?([^0-9]|$)' 'active wildcard listener'
 require_clean_match_free 'CLIPMESH_[A-Z0-9_]*(CONTENT|PAYLOAD)[A-Z0-9_]*CANARY[A-Z0-9_]*' 'clipboard content canary'
 require_clean_match_free '(secret|token|password|credential)[[:space:]]*[:=][[:space:]]*[A-Za-z0-9_+/=-]{40,}' 'high-entropy secret assignment'
+
+normalize_url_host() {
+  local url="$1"
+  url=$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')
+  url="${url#http://}"
+  url="${url#https://}"
+  printf '%s\n' "${url%%[/:?#]*}"
+}
 
 is_reserved_network_host() {
   case "$1" in
@@ -55,32 +65,46 @@ is_reserved_network_host() {
   esac
 }
 
+is_private_network_host() {
+  case "$1" in
+    internal|local|lan|home|corp|*.internal|*.local|*.lan|*.home|*.corp) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 require_reserved_network_hosts() {
-  local path commit host
+  local path commit url host
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
-    while IFS= read -r host; do
+    while IFS= read -r url; do
+      host=$(normalize_url_host "$url")
+      is_private_network_host "$host" && fail "private service hostname in tracked bytes path $path"
       is_reserved_network_host "$host" || fail "non-reserved network name in tracked bytes path $path"
-    done < <(grep -Eo 'https?://[^/[:space:]]+' -- "$path" | sed -E 's|^https?://||; s|[:/?#].*$||')
-  done < <(git grep -l -E 'https?://[^/[:space:]]+' -- . ":!$SCANNER_PATH" || true)
+    done < <(grep -Eio 'https?://[^/[:space:]]+' -- "$path")
+  done < <(git grep -li -E 'https?://[^/[:space:]]+' -- . ":!$SCANNER_PATH" || true)
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
-    while IFS= read -r host; do
+    while IFS= read -r url; do
+      host=$(normalize_url_host "$url")
+      is_private_network_host "$host" && fail "private service hostname in staged bytes path $path"
       is_reserved_network_host "$host" || fail "non-reserved network name in staged bytes path $path"
-    done < <(git show ":$path" 2>/dev/null | grep -Eo 'https?://[^/[:space:]]+' | sed -E 's|^https?://||; s|[:/?#].*$||')
+    done < <(git show ":$path" 2>/dev/null | grep -Eio 'https?://[^/[:space:]]+')
   done < <(git diff --cached --name-only --diff-filter=AM -- . ":!$SCANNER_PATH")
   while IFS= read -r commit; do
     while IFS= read -r path; do
       path="${path#"$commit:"}"
       [[ -z "$path" ]] && continue
-      while IFS= read -r host; do
+      while IFS= read -r url; do
+        host=$(normalize_url_host "$url")
+        is_private_network_host "$host" && fail "private service hostname in reachable Git history commit $commit path $path"
         is_reserved_network_host "$host" || fail "non-reserved network name in reachable Git history commit $commit path $path"
-      done < <(git show "$commit:$path" | grep -Eo 'https?://[^/[:space:]]+' | sed -E 's|^https?://||; s|[:/?#].*$||')
-    done < <(git grep -l -E 'https?://[^/[:space:]]+' "$commit" -- . ":!$SCANNER_PATH" || true)
+      done < <(git show "$commit:$path" | grep -Eio 'https?://[^/[:space:]]+')
+    done < <(git grep -li -E 'https?://[^/[:space:]]+' "$commit" -- . ":!$SCANNER_PATH" || true)
   done < <(git rev-list HEAD -- . ":(exclude)$SCANNER_PATH")
 }
 
 require_reserved_network_hosts
+require_clean_match_free '([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9.-]|$)' 'private service hostname' case_insensitive
 
 # The exact denylist stays owner-only. A hit identifies only its line and the
 # public path or commit that needs repair; it never writes the private literal.
