@@ -6,7 +6,10 @@
 use std::{fmt, str::FromStr};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, DeserializeOwned},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::{Uuid, Variant, Version};
@@ -509,7 +512,9 @@ pub struct FailureResponse {
     code: FailureCode,
 }
 impl FailureResponse {
-    fn non_secret(code: FailureCode) -> Result<Self, &'static str> {
+    /// Creates an ordinary failure response while reserving the secret-result
+    /// code for its resource-bound control-error variant.
+    pub fn non_secret(code: FailureCode) -> Result<Self, &'static str> {
         if matches!(code, FailureCode::SecretResultAlreadyCommitted) {
             return Err("secret_result_already_committed requires a resource ID");
         }
@@ -677,6 +682,14 @@ impl<'de> Deserialize<'de> for InitialCredentialGeneration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CredentialGeneration(u64);
 impl CredentialGeneration {
+    /// Creates a positive credential generation for outbound rotation results.
+    pub fn new(value: u64) -> Result<Self, &'static str> {
+        if value == 0 {
+            Err("credential generation must be positive")
+        } else {
+            Ok(Self(value))
+        }
+    }
     pub fn get(self) -> u64 {
         self.0
     }
@@ -689,11 +702,7 @@ impl Serialize for CredentialGeneration {
 impl<'de> Deserialize<'de> for CredentialGeneration {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = u64::deserialize(deserializer)?;
-        if value == 0 {
-            Err(de::Error::custom("credential generation must be positive"))
-        } else {
-            Ok(Self(value))
-        }
+        Self::new(value).map_err(de::Error::custom)
     }
 }
 
@@ -986,15 +995,49 @@ fn ensure_v1(text: &str) -> Result<(), DecodeError> {
     Ok(())
 }
 
-/// Decodes a closed client-to-hub version-1 JSON object.
-pub fn decode_client_message(text: &str) -> Result<ClientMessageV1, DecodeError> {
+mod inbound_v1 {
+    pub trait Sealed {}
+}
+
+/// A closed protocol schema that must be decoded through the v1 preflight.
+pub trait InboundV1: inbound_v1::Sealed + DeserializeOwned {}
+
+macro_rules! inbound_v1 {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl inbound_v1::Sealed for $type {}
+            impl InboundV1 for $type {}
+        )+
+    };
+}
+
+inbound_v1!(
+    ClientMessageV1,
+    ServerMessageV1,
+    CreateManagedDeviceRequestV1,
+    CreateEnrollmentArtifactRequestV1,
+    EnrollRequestV1,
+    RotateCredentialRequestV1,
+    RevokeDeviceRequestV1,
+    PurgeHistoryRequestV1,
+    SetPauseStateRequestV1,
+    ControlSuccessV1,
+    ControlErrorResponseV1,
+);
+
+/// Decodes any closed inbound v1 schema after enforcing version precedence.
+pub fn decode_inbound_v1<T: InboundV1>(text: &str) -> Result<T, DecodeError> {
     ensure_v1(text)?;
     serde_json::from_str(text).map_err(|_| DecodeError::ProtocolSchemaInvalid)
 }
+
+/// Decodes a closed client-to-hub version-1 JSON object.
+pub fn decode_client_message(text: &str) -> Result<ClientMessageV1, DecodeError> {
+    decode_inbound_v1(text)
+}
 /// Decodes a closed hub-to-client version-1 JSON object.
 pub fn decode_server_message(text: &str) -> Result<ServerMessageV1, DecodeError> {
-    ensure_v1(text)?;
-    serde_json::from_str(text).map_err(|_| DecodeError::ProtocolSchemaInvalid)
+    decode_inbound_v1(text)
 }
 
 #[cfg(test)]
@@ -1117,13 +1160,33 @@ mod tests {
     #[test]
     fn control_plane_schemas_are_closed_and_platform_specific() {
         let request = r#"{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","display_name":"Synthetic desktop","platform":"linux_wayland"}"#;
-        assert!(serde_json::from_str::<CreateManagedDeviceRequestV1>(request).is_ok());
+        assert!(decode_inbound_v1::<CreateManagedDeviceRequestV1>(request).is_ok());
         assert!(serde_json::from_str::<CreateEnrollmentArtifactRequestV1>(request).is_err());
         assert!(
             serde_json::from_str::<CreateManagedDeviceRequestV1>(&format!("{request} ")).is_ok()
         );
         let invalid_pause = r#"{"protocol_version":1,"request_id":"00000000-0000-4000-8000-000000000003","scope":"global","device_id":"00000000-0000-4000-8000-000000000004","paused":true}"#;
         assert!(serde_json::from_str::<SetPauseStateRequestV1>(invalid_pause).is_err());
+        for version in ["2", "18446744073709551616"] {
+            assert_matches!(
+                decode_inbound_v1::<CreateManagedDeviceRequestV1>(&request.replacen(
+                    "\"protocol_version\":1",
+                    &format!("\"protocol_version\":{version}"),
+                    1,
+                )),
+                Err(DecodeError::ProtocolVersionUnsupported)
+            );
+        }
+        for version in ["1.0", "true", "\"1\""] {
+            assert_matches!(
+                decode_inbound_v1::<CreateManagedDeviceRequestV1>(&request.replacen(
+                    "\"protocol_version\":1",
+                    &format!("\"protocol_version\":{version}"),
+                    1,
+                )),
+                Err(DecodeError::ProtocolSchemaInvalid)
+            );
+        }
     }
 
     #[test]
@@ -1137,5 +1200,11 @@ mod tests {
         assert!(serde_json::from_str::<ControlSuccessV1>(invalid_revoked).is_err());
         let missing_resource = r#"{"protocol_version":1,"error":{"code":"secret_result_already_committed","retryable":false}}"#;
         assert!(serde_json::from_str::<ControlErrorResponseV1>(missing_resource).is_err());
+
+        let failure = FailureResponse::non_secret(FailureCode::PayloadEmpty).unwrap();
+        assert_eq!(failure.code(), &FailureCode::PayloadEmpty);
+        assert!(FailureResponse::non_secret(FailureCode::SecretResultAlreadyCommitted).is_err());
+        assert!(CredentialGeneration::new(0).is_err());
+        assert_eq!(CredentialGeneration::new(2).unwrap().get(), 2);
     }
 }
