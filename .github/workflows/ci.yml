@@ -14,3 +14,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-targets
       - run: scripts/check-repository-boundary.sh
+      - run: scripts/test-repository-boundary.sh
