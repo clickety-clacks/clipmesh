@@ -205,6 +205,12 @@ pub struct QueuedLiveEvent {
     pub event: RetainedEvent,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionOutput {
+    PublishAccepted(AcceptedPublish),
+    LiveEvent(QueuedLiveEvent),
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CoreError {
     #[error("hub state rejected the operation: {0:?}")]
@@ -277,7 +283,7 @@ struct Session {
     credential_generation: u64,
     history_epoch: Uuid,
     phase: SessionPhase,
-    queue: VecDeque<QueuedLiveEvent>,
+    queue: VecDeque<SessionOutput>,
 }
 
 struct State {
@@ -758,10 +764,16 @@ impl HubCore {
         Ok(())
     }
 
-    pub fn take_next_live_for_transport(
+    /// Performs the final transport handoff while the mutation-recipient seam is held.
+    ///
+    /// The callback is the transport boundary: eligibility is checked immediately
+    /// before it runs, and the output is removed only when the callback succeeds.
+    /// Callers must not block on another `HubCore` operation from the callback.
+    pub fn handoff_next_output<E>(
         &self,
         session_id: Uuid,
-    ) -> Result<Option<QueuedLiveEvent>, CoreError> {
+        handoff: impl FnOnce(&SessionOutput) -> Result<(), E>,
+    ) -> Result<Option<Result<(), E>>, CoreError> {
         let mut state = self.state.lock().expect("hub state lock poisoned");
         let history_epoch = state.history_epoch;
         let session = state
@@ -771,7 +783,14 @@ impl HubCore {
         if session.phase != SessionPhase::Live || session.history_epoch != history_epoch {
             return Err(CoreError::Failure(FailureCode::SessionEpochStale));
         }
-        Ok(session.queue.pop_front())
+        let Some(output) = session.queue.front() else {
+            return Ok(None);
+        };
+        let result = handoff(output);
+        if result.is_ok() {
+            session.queue.pop_front();
+        }
+        Ok(Some(result))
     }
 
     pub fn publish(
@@ -779,7 +798,7 @@ impl HubCore {
         session_id: Uuid,
         event: ClipboardEventV1,
         now_ms: i64,
-    ) -> Result<AcceptedPublish, CoreError> {
+    ) -> Result<(), CoreError> {
         let mut state = self.state.lock().expect("hub state lock poisoned");
         let (device_id, credential_generation, session_epoch) = {
             let session = state
@@ -810,11 +829,16 @@ impl HubCore {
         let message_id = event.message_id.get();
         if let Some(retained) = find_retained_event(&state, message_id)? {
             return if retained.event == event {
-                Ok(AcceptedPublish {
-                    cursor: retained.cursor,
-                    expires_at_ms: retained.event.expires_at_ms,
-                    duplicate: true,
-                })
+                enqueue_publish_accepted(
+                    &mut state,
+                    session_id,
+                    AcceptedPublish {
+                        cursor: retained.cursor,
+                        expires_at_ms: retained.event.expires_at_ms,
+                        duplicate: true,
+                    },
+                )?;
+                Ok(())
             } else {
                 Err(CoreError::Failure(FailureCode::MessageIdConflict))
             };
@@ -838,14 +862,9 @@ impl HubCore {
             source_display_name,
             event,
         };
-        persist_publish(&mut state, &stored)?;
-        expire_and_trim_locked(&mut state, now_ms)?;
-        enqueue_accepted(&mut state, &stored);
-        Ok(AcceptedPublish {
-            cursor,
-            expires_at_ms: stored.event.expires_at_ms,
-            duplicate: false,
-        })
+        persist_publish_with_retention(&mut state, &stored, now_ms)?;
+        enqueue_accepted(&mut state, session_id, &stored)?;
+        Ok(())
     }
 
     pub fn rotate_credential(
@@ -1823,7 +1842,15 @@ fn recheck_publish_authority(
     Ok(())
 }
 
-fn persist_publish(state: &mut State, event: &StoredEvent) -> Result<(), CoreError> {
+fn persist_publish_with_retention(
+    state: &mut State,
+    event: &StoredEvent,
+    now_ms: i64,
+) -> Result<(), CoreError> {
+    let mut next_memory_events = state.memory_events.clone();
+    if state.history_mode == HistoryMode::Memory {
+        next_memory_events.insert(event.cursor, event.clone());
+    }
     let tx = state.connection.transaction()?;
     set_metadata_tx(&tx, "cursor_high_water", &event.cursor.to_string())?;
     tx.execute(
@@ -1863,11 +1890,53 @@ fn persist_publish(state: &mut State, event: &StoredEvent) -> Result<(), CoreErr
             ],
         )?;
     }
+
+    let retained: Vec<(u64, i64)> = match state.history_mode {
+        HistoryMode::Memory => next_memory_events
+            .values()
+            .map(|stored| (stored.cursor, stored.event.expires_at_ms))
+            .collect(),
+        HistoryMode::Sqlite => {
+            let mut statement =
+                tx.prepare("SELECT cursor, expires_at_ms FROM events ORDER BY cursor")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut retained = Vec::new();
+            for row in rows {
+                let (cursor, expires_at_ms) = row?;
+                retained.push((
+                    cursor
+                        .parse()
+                        .map_err(|_| CoreError::DatabaseIntegrityFailed)?,
+                    expires_at_ms,
+                ));
+            }
+            retained.sort_by_key(|(cursor, _)| *cursor);
+            retained
+        }
+    };
+    let remove = retention_removals(&retained, now_ms, state.limits.history_max_entries);
+    for cursor in &remove {
+        tx.execute(
+            "DELETE FROM events WHERE cursor = ?1",
+            params![cursor.to_string()],
+        )?;
+        next_memory_events.remove(cursor);
+    }
+    let lost_through = remove
+        .last()
+        .copied()
+        .map_or(state.lost_through_cursor, |lost| {
+            Some(state.lost_through_cursor.map_or(lost, |old| old.max(lost)))
+        });
+    set_optional_u64_metadata_tx(&tx, "lost_through_cursor", lost_through)?;
     tx.commit()?;
     state.cursor_high_water = event.cursor;
     if state.history_mode == HistoryMode::Memory {
-        state.memory_events.insert(event.cursor, event.clone());
+        state.memory_events = next_memory_events;
     }
+    state.lost_through_cursor = lost_through;
     Ok(())
 }
 
@@ -1964,27 +2033,14 @@ fn stored_event_from_row(row: (String, i64, String, String)) -> Result<StoredEve
 
 fn expire_and_trim_locked(state: &mut State, now_ms: i64) -> Result<(), CoreError> {
     let events = retained_events(state)?;
-    let mut remove: Vec<u64> = events
+    let retained: Vec<_> = events
         .iter()
-        .filter(|event| event.event.expires_at_ms <= now_ms)
-        .map(|event| event.cursor)
+        .map(|event| (event.cursor, event.event.expires_at_ms))
         .collect();
-    let remaining = events.len().saturating_sub(remove.len());
-    if remaining > state.limits.history_max_entries {
-        let trim_count = remaining - state.limits.history_max_entries;
-        let trimmed: Vec<_> = events
-            .iter()
-            .filter(|event| !remove.contains(&event.cursor))
-            .take(trim_count)
-            .map(|event| event.cursor)
-            .collect();
-        remove.extend(trimmed);
-    }
+    let remove = retention_removals(&retained, now_ms, state.limits.history_max_entries);
     if remove.is_empty() {
         return Ok(());
     }
-    remove.sort_unstable();
-    remove.dedup();
     let lost = *remove.last().expect("remove is nonempty");
     let tx = state.connection.transaction()?;
     for cursor in &remove {
@@ -2003,11 +2059,67 @@ fn expire_and_trim_locked(state: &mut State, now_ms: i64) -> Result<(), CoreErro
     Ok(())
 }
 
-fn enqueue_accepted(state: &mut State, event: &StoredEvent) {
-    let queued = QueuedLiveEvent {
+fn retention_removals(
+    retained: &[(u64, i64)],
+    now_ms: i64,
+    history_max_entries: usize,
+) -> Vec<u64> {
+    let mut remove: Vec<u64> = retained
+        .iter()
+        .filter_map(|(cursor, expires_at_ms)| (*expires_at_ms <= now_ms).then_some(*cursor))
+        .collect();
+    let remaining = retained.len().saturating_sub(remove.len());
+    if remaining > history_max_entries {
+        let trim_count = remaining - history_max_entries;
+        let trimmed: Vec<_> = retained
+            .iter()
+            .filter(|(cursor, _)| !remove.contains(cursor))
+            .take(trim_count)
+            .map(|(cursor, _)| *cursor)
+            .collect();
+        remove.extend(trimmed);
+    }
+    remove.sort_unstable();
+    remove.dedup();
+    remove
+}
+
+fn enqueue_publish_accepted(
+    state: &mut State,
+    source_session_id: Uuid,
+    accepted: AcceptedPublish,
+) -> Result<(), CoreError> {
+    let session = state
+        .sessions
+        .get_mut(&source_session_id)
+        .ok_or(CoreError::Failure(FailureCode::Unauthorized))?;
+    if session.phase != SessionPhase::Live || session.history_epoch != state.history_epoch {
+        return Err(CoreError::Failure(FailureCode::SessionEpochStale));
+    }
+    session
+        .queue
+        .push_back(SessionOutput::PublishAccepted(accepted));
+    Ok(())
+}
+
+fn enqueue_accepted(
+    state: &mut State,
+    source_session_id: Uuid,
+    event: &StoredEvent,
+) -> Result<(), CoreError> {
+    enqueue_publish_accepted(
+        state,
+        source_session_id,
+        AcceptedPublish {
+            cursor: event.cursor,
+            expires_at_ms: event.event.expires_at_ms,
+            duplicate: false,
+        },
+    )?;
+    let queued = SessionOutput::LiveEvent(QueuedLiveEvent {
         history_epoch: state.history_epoch,
         event: event.retained(),
-    };
+    });
     for session in state.sessions.values_mut() {
         if matches!(session.phase, SessionPhase::Buffering | SessionPhase::Live)
             && session.history_epoch == state.history_epoch
@@ -2015,6 +2127,7 @@ fn enqueue_accepted(state: &mut State, event: &StoredEvent) {
             session.queue.push_back(queued.clone());
         }
     }
+    Ok(())
 }
 
 fn cutoff_device_sessions(state: &mut State, device_id: Uuid) -> Vec<Uuid> {
@@ -2052,7 +2165,13 @@ fn parse_uuid_v4(value: &str) -> Result<Uuid, CoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, process::Command, sync::Arc, thread};
+    use std::{
+        env, fs,
+        process::Command,
+        sync::{mpsc, Arc},
+        thread,
+        time::Duration,
+    };
 
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use clipmesh_protocol::{
@@ -2169,6 +2288,27 @@ mod tests {
         assert_eq!(plan.status, ResumeStatus::Fresh);
         core.complete_resume(session_id).unwrap();
         session_id
+    }
+
+    fn take_output(core: &HubCore, session_id: Uuid) -> Result<Option<SessionOutput>, CoreError> {
+        let mut output = None;
+        let handed = core.handoff_next_output(session_id, |queued| {
+            output = Some(queued.clone());
+            Ok::<(), ()>(())
+        })?;
+        match handed {
+            None => Ok(None),
+            Some(Ok(())) => Ok(output),
+            Some(Err(())) => unreachable!("test handoff cannot fail"),
+        }
+    }
+
+    fn take_live(core: &HubCore, session_id: Uuid) -> Result<Option<QueuedLiveEvent>, CoreError> {
+        match take_output(core, session_id)? {
+            Some(SessionOutput::LiveEvent(event)) => Ok(Some(event)),
+            Some(SessionOutput::PublishAccepted(_)) => panic!("expected a live event"),
+            None => Ok(None),
+        }
     }
 
     fn run_restart_probe(
@@ -2567,10 +2707,8 @@ mod tests {
             created,
             expires,
         );
-        assert_eq!(
-            fixture.core.publish(session, accepted, NOW).unwrap().cursor,
-            1
-        );
+        fixture.core.publish(session, accepted, NOW).unwrap();
+        assert_eq!(fixture.core.cursor_high_water(), 1);
 
         let too_large = vec![b'y'; payload.len() + 1];
         let rejected = event_with_content_type(
@@ -2643,17 +2781,13 @@ mod tests {
                         ),
                         NOW,
                     )
-                    .unwrap()
-                    .cursor
+                    .unwrap();
                 })
             })
             .collect();
-        let mut returned: Vec<_> = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect();
-        returned.sort_unstable();
-        assert_eq!(returned, (1..=25).collect::<Vec<_>>());
+        for handle in handles {
+            handle.join().unwrap();
+        }
         let cursors: Vec<_> = core
             .history(NOW)
             .unwrap()
@@ -2663,7 +2797,7 @@ mod tests {
         assert_eq!(cursors, (1..=25).collect::<Vec<_>>());
         for receiver in [receiver_a_session, receiver_b_session] {
             let mut delivered = Vec::new();
-            while let Some(event) = core.take_next_live_for_transport(receiver).unwrap() {
+            while let Some(event) = take_live(&core, receiver).unwrap() {
                 delivered.push(event.event.cursor);
             }
             assert_eq!(delivered, (1..=25).collect::<Vec<_>>());
@@ -2686,40 +2820,38 @@ mod tests {
             NOW,
             NOW + 10_000,
         );
+        fixture
+            .core
+            .publish(session, original.clone(), NOW)
+            .unwrap();
         assert_eq!(
-            fixture
-                .core
-                .publish(session, original.clone(), NOW)
-                .unwrap(),
-            AcceptedPublish {
+            take_output(&fixture.core, session).unwrap().unwrap(),
+            SessionOutput::PublishAccepted(AcceptedPublish {
                 cursor: 1,
                 expires_at_ms: NOW + 10_000,
                 duplicate: false,
-            }
+            })
         );
+        assert!(matches!(
+            take_output(&fixture.core, session).unwrap(),
+            Some(SessionOutput::LiveEvent(_))
+        ));
         for _ in 0..10 {
+            fixture
+                .core
+                .publish(session, original.clone(), NOW)
+                .unwrap();
             assert_eq!(
-                fixture
-                    .core
-                    .publish(session, original.clone(), NOW)
-                    .unwrap(),
-                AcceptedPublish {
+                take_output(&fixture.core, session).unwrap().unwrap(),
+                SessionOutput::PublishAccepted(AcceptedPublish {
                     cursor: 1,
                     expires_at_ms: NOW + 10_000,
                     duplicate: true,
-                }
+                })
             );
         }
-        assert!(fixture
-            .core
-            .take_next_live_for_transport(peer_session)
-            .unwrap()
-            .is_some());
-        assert!(fixture
-            .core
-            .take_next_live_for_transport(peer_session)
-            .unwrap()
-            .is_none());
+        assert!(take_live(&fixture.core, peer_session).unwrap().is_some());
+        assert!(take_live(&fixture.core, peer_session).unwrap().is_none());
         let changed = event(
             source.record.device_id,
             1,
@@ -2789,12 +2921,9 @@ mod tests {
             let right_core = Arc::clone(&core);
             let right =
                 thread::spawn(move || right_core.publish(second_session, event, NOW).unwrap());
-            let mut results = [left.join().unwrap(), right.join().unwrap()];
-            results.sort_by_key(|result| result.duplicate);
-            assert!(!results[0].duplicate);
-            assert!(results[1].duplicate);
-            assert_eq!(results[0].cursor, sequence);
-            assert_eq!(results[1].cursor, sequence);
+            left.join().unwrap();
+            right.join().unwrap();
+            assert_eq!(core.cursor_high_water(), sequence);
         }
         assert_eq!(core.cursor_high_water(), 100);
         assert_eq!(core.history(NOW).unwrap().len(), 100);
@@ -2851,9 +2980,7 @@ mod tests {
             .unwrap();
         fixture.core.complete_resume(target_session).unwrap();
         assert_eq!(
-            fixture
-                .core
-                .take_next_live_for_transport(target_session)
+            take_live(&fixture.core, target_session)
                 .unwrap()
                 .unwrap()
                 .event
@@ -2991,6 +3118,82 @@ mod tests {
             .iter()
             .all(|event| event.cursor != 5));
         assert_eq!(fixture.core.lost_through_cursor(), Some(5));
+    }
+
+    #[test]
+    fn retention_failure_rolls_back_the_entire_publish_unit() {
+        let fixture = fixture(
+            HistoryMode::Sqlite,
+            RetentionLimits {
+                history_max_entries: 1,
+                ..RetentionLimits::default()
+            },
+        );
+        let source = create_device(&fixture.core, &fixture.administrator, "Source", 1);
+        let session = live_session(&fixture.core, &source.credential);
+        let first_message_id = Uuid::new_v4();
+        fixture
+            .core
+            .publish(
+                session,
+                event(
+                    source.record.device_id,
+                    1,
+                    first_message_id,
+                    "first",
+                    NOW,
+                    NOW + 10_000,
+                ),
+                NOW,
+            )
+            .unwrap();
+        take_output(&fixture.core, session).unwrap().unwrap();
+        take_output(&fixture.core, session).unwrap().unwrap();
+
+        fixture
+            .core
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_event_delete BEFORE DELETE ON events
+                 BEGIN SELECT RAISE(FAIL, 'injected retention failure'); END;",
+            )
+            .unwrap();
+        let second_message_id = Uuid::new_v4();
+        assert_eq!(
+            fixture.core.publish(
+                session,
+                event(
+                    source.record.device_id,
+                    2,
+                    second_message_id,
+                    "second",
+                    NOW,
+                    NOW + 10_000,
+                ),
+                NOW,
+            ),
+            Err(CoreError::StorageUnavailable)
+        );
+
+        let state = fixture.core.state.lock().unwrap();
+        assert_eq!(state.cursor_high_water, 1);
+        assert_eq!(
+            source_high_water(&state.connection, source.record.device_id).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            tombstone(&state.connection, first_message_id).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            tombstone(&state.connection, second_message_id).unwrap(),
+            None
+        );
+        assert_eq!(retained_events(&state).unwrap().len(), 1);
+        assert!(state.sessions.get(&session).unwrap().queue.is_empty());
     }
 
     #[test]
@@ -3150,13 +3353,11 @@ mod tests {
             .unwrap();
         assert_eq!(rotated.cut_off_sessions, vec![source_session]);
         assert_eq!(
-            fixture.core.take_next_live_for_transport(source_session),
+            take_output(&fixture.core, source_session),
             Err(CoreError::Failure(FailureCode::Unauthorized))
         );
         assert_eq!(
-            fixture
-                .core
-                .take_next_live_for_transport(peer_session)
+            take_live(&fixture.core, peer_session)
                 .unwrap()
                 .unwrap()
                 .event
@@ -3192,13 +3393,21 @@ mod tests {
             .unwrap();
         assert_eq!(paused.cut_off_sessions, vec![peer_session]);
         assert_eq!(
-            fixture.core.take_next_live_for_transport(peer_session),
+            take_output(&fixture.core, peer_session),
             Err(CoreError::Failure(FailureCode::Unauthorized))
         );
         assert_eq!(
-            fixture
-                .core
-                .take_next_live_for_transport(new_source_session)
+            take_output(&fixture.core, new_source_session)
+                .unwrap()
+                .unwrap(),
+            SessionOutput::PublishAccepted(AcceptedPublish {
+                cursor: 2,
+                expires_at_ms: NOW + 10_000,
+                duplicate: false,
+            })
+        );
+        assert_eq!(
+            take_live(&fixture.core, new_source_session)
                 .unwrap()
                 .unwrap()
                 .event
@@ -3213,6 +3422,73 @@ mod tests {
         assert_eq!(
             fixture.core.open_session(&rotated.credential),
             Err(CoreError::Failure(FailureCode::AdministrativelyPaused))
+        );
+    }
+
+    #[test]
+    fn transport_handoff_and_administrative_cutoff_share_one_seam() {
+        let fixture = fixture(HistoryMode::Sqlite, RetentionLimits::default());
+        let source = create_device(&fixture.core, &fixture.administrator, "Source", 1);
+        let target = create_device(&fixture.core, &fixture.administrator, "Target", 2);
+        let source_session = live_session(&fixture.core, &source.credential);
+        let target_session = live_session(&fixture.core, &target.credential);
+        fixture
+            .core
+            .publish(
+                source_session,
+                event(
+                    source.record.device_id,
+                    1,
+                    Uuid::new_v4(),
+                    "handoff under seam",
+                    NOW,
+                    NOW + 10_000,
+                ),
+                NOW,
+            )
+            .unwrap();
+
+        let core = Arc::new(fixture.core);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handoff_core = Arc::clone(&core);
+        let handoff = thread::spawn(move || {
+            handoff_core
+                .handoff_next_output(target_session, |output| {
+                    assert!(matches!(output, SessionOutput::LiveEvent(_)));
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<(), ()>(())
+                })
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        let (cutoff_tx, cutoff_rx) = mpsc::channel();
+        let cutoff_core = Arc::clone(&core);
+        let administrator = fixture.administrator.clone();
+        let cutoff = thread::spawn(move || {
+            let result = cutoff_core.revoke_device(
+                &administrator,
+                request(9),
+                target.record.device_id,
+                NOW + 1,
+            );
+            cutoff_tx.send(result).unwrap();
+        });
+        assert!(cutoff_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release_tx.send(()).unwrap();
+        handoff.join().unwrap();
+        assert_eq!(
+            cutoff_rx.recv().unwrap().unwrap().cut_off_sessions,
+            vec![target_session]
+        );
+        cutoff.join().unwrap();
+        assert_eq!(
+            take_output(&core, target_session),
+            Err(CoreError::Failure(FailureCode::Unauthorized))
         );
     }
 
@@ -3251,25 +3527,22 @@ mod tests {
             fixture.core.open_session(&revoked.credential),
             Err(CoreError::Failure(FailureCode::Unauthorized))
         );
-        assert_eq!(
-            fixture
-                .core
-                .publish(
-                    peer_session,
-                    event(
-                        peer.record.device_id,
-                        1,
-                        Uuid::new_v4(),
-                        "peer remains live",
-                        NOW,
-                        NOW + 1_000,
-                    ),
+        fixture
+            .core
+            .publish(
+                peer_session,
+                event(
+                    peer.record.device_id,
+                    1,
+                    Uuid::new_v4(),
+                    "peer remains live",
                     NOW,
-                )
-                .unwrap()
-                .cursor,
-            1
-        );
+                    NOW + 1_000,
+                ),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(fixture.core.cursor_high_water(), 1);
     }
 
     #[test]
