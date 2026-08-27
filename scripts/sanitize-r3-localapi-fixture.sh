@@ -10,16 +10,16 @@ fi
 
 input=$1
 output=$2
+contract="$(dirname "$0")/../crates/clipmesh-hub-edge/src/localapi-compatibility-v1.json"
 
 if command -v jq >/dev/null 2>&1; then
-  jq '
-    def status_fields: ["TailscaleIPs", "BackendState", "Self", "Peer", "User", "CurrentTailnet", "Health", "MagicDNSSuffix", "CertDomains", "Version", "TUN", "HaveNodeKey", "AuthURL", "ExitNodeStatus", "ExtraRecords", "ClientVersion"];
-    def whois_fields: ["Node", "UserProfile", "CapMap"];
+  jq --slurpfile contracts "$contract" '
+    $contracts[0] as $contract |
     def only_fields($allowed):
       [keys[] as $key | select($allowed | index($key) | not)] | length == 0;
-    if (type == "object") and only_fields(status_fields) and (has("TailscaleIPs")) and (.TailscaleIPs | type == "array") and (.TailscaleIPs | all(type == "string" and length > 0)) then
+    if (type == "object") and only_fields($contract.schema.status.allowed_fields) and (has("TailscaleIPs")) and (.TailscaleIPs | type == "array") and (.TailscaleIPs | all(type == "string" and length > 0)) then
       {upstream_compatibility: "tailscale-v1.100.0-c811bb19bf3b0c89061ac7b7a073f6cd23b504d0", kind: "status", TailscaleIPs: (.TailscaleIPs | map("[redacted]"))}
-    elif (type == "object") and only_fields(whois_fields) and (has("Node")) and (.Node | type == "object") and (.Node.StableID | type == "string" and length > 0) and ((has("UserProfile") | not) or (.UserProfile | type == "object")) and ((has("CapMap") | not) or (.CapMap | type == "object")) then
+    elif (type == "object") and only_fields($contract.schema.whois.allowed_fields) and (has("Node")) and (.Node | type == "object") and (.Node.StableID | type == "string" and length > 0) and (. as $response | [$contract.schema.whois.object_fields[] as $field | select(($response | has($field)) and ($response[$field] | type != "object"))] | length == 0) then
       {upstream_compatibility: "tailscale-v1.100.0-c811bb19bf3b0c89061ac7b7a073f6cd23b504d0", kind: "whois", Node: {StableID: "[redacted]"}}
     else error("unexpected LocalAPI schema") end
   ' "$input" >"$output"

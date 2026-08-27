@@ -5,6 +5,15 @@
     "status_type": "ipnstate.Status",
     "whois_type": "apitype.WhoIsResponse"
   },
+  "schema": {
+    "status": {
+      "allowed_fields": ["TailscaleIPs", "BackendState", "Self", "Peer", "User", "CurrentTailnet", "Health", "MagicDNSSuffix", "CertDomains", "Version", "TUN", "HaveNodeKey", "AuthURL", "ExitNodeStatus", "ExtraRecords", "ClientVersion"]
+    },
+    "whois": {
+      "allowed_fields": ["Node", "UserProfile", "CapMap"],
+      "object_fields": ["UserProfile", "CapMap"]
+    }
+  },
   "status": {
     "TailscaleIPs": ["100.64.0.7"],
     "BackendState": "Running",

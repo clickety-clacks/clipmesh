@@ -41,6 +41,7 @@ const LOCALAPI_RESPONSE_LIMIT: usize = 131_072;
 pub const TAILSCALE_LOCALAPI_COMPATIBILITY_VERSION: &str = "v1.100.0";
 pub const TAILSCALE_LOCALAPI_COMPATIBILITY_REVISION: &str =
     "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0";
+const LOCALAPI_COMPATIBILITY_CONTRACT: &str = include_str!("localapi-compatibility-v1.json");
 
 /// Concrete owner of the host-local Tailscale daemon socket.
 ///
@@ -112,16 +113,26 @@ impl SystemLocalApi {
     fn who_is(&self, remote: SocketAddr) -> Result<String, LocalApiError> {
         let value = self.request(&format!("/localapi/v0/whois?addr={remote}"))?;
         let object = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
-        if !object
-            .keys()
-            .all(|key| matches!(key.as_str(), "Node" | "UserProfile" | "CapMap"))
-        {
-            return Err(LocalApiError::MalformedResponse);
-        }
-        if ["UserProfile", "CapMap"]
-            .into_iter()
-            .any(|field| object.get(field).is_some_and(|value| !value.is_object()))
-        {
+        let contract: Value = serde_json::from_str(LOCALAPI_COMPATIBILITY_CONTRACT)
+            .map_err(|_| LocalApiError::MalformedResponse)?;
+        let allowed_fields = contract
+            .pointer("/schema/whois/allowed_fields")
+            .and_then(Value::as_array)
+            .ok_or(LocalApiError::MalformedResponse)?;
+        let object_fields = contract
+            .pointer("/schema/whois/object_fields")
+            .and_then(Value::as_array)
+            .ok_or(LocalApiError::MalformedResponse)?;
+        if !object.keys().all(|key| {
+            allowed_fields
+                .iter()
+                .any(|field| field.as_str() == Some(key.as_str()))
+        }) || object_fields.iter().any(|field| {
+            field
+                .as_str()
+                .and_then(|field| object.get(field))
+                .is_some_and(|value| !value.is_object())
+        }) {
             return Err(LocalApiError::MalformedResponse);
         }
         value
@@ -1844,9 +1855,6 @@ mod tests {
     use tempfile::tempdir;
 
     const NOW: i64 = 1_700_000_000_000;
-    const LOCALAPI_COMPATIBILITY_CONTRACT: &str =
-        include_str!("../tests/fixtures/r3-localapi-compatibility-v1.json");
-
     fn compatibility_contract() -> Value {
         serde_json::from_str(LOCALAPI_COMPATIBILITY_CONTRACT).unwrap()
     }
