@@ -312,6 +312,17 @@ pub struct PublishAccepted {
     pub duplicate: bool,
 }
 
+/// Result of the scalar-only publish gate that runs before payload decoding.
+///
+/// The retained form intentionally does not decide duplicate versus conflict:
+/// that decision needs the subsequently decoded content and remains serialized
+/// in [`HubCore::publish`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishPreflight {
+    New,
+    Retained,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedClip {
     pub cursor: u64,
@@ -782,21 +793,29 @@ impl HubCore {
         Ok(accepted)
     }
 
-    /// Checks the publish state boundary before an edge decodes payload bytes.
+    /// Classifies the publish state boundary before an edge decodes payload bytes.
     ///
     /// A malformed payload must not mask a stale session or clear generation.
     /// The edge calls this at ingress and `publish` repeats the same checks at
     /// its serialized mutation point to close the intervening-state race.
-    pub fn validate_publish_context(
+    pub fn preflight_publish(
         &self,
         session_id: Uuid,
         clear_generation: u64,
-    ) -> Result<(), CoreError> {
+        message_id: Uuid,
+        now_ms: i64,
+    ) -> Result<PublishPreflight, CoreError> {
         let state = self.state.lock().expect("hub state lock poisoned");
         require_session_exists(&state, session_id)?;
         compare_generation(clear_generation, state.clear_generation)?;
         require_live_session(&state, session_id)?;
-        Ok(())
+        if load_clip_by_message_id(&state.connection, message_id, now_ms)?.is_some() {
+            return Ok(PublishPreflight::Retained);
+        }
+        if tombstone_exists(&state.connection, message_id)? {
+            return Err(CoreError::Failure(FailureCode::MessageIdReplay));
+        }
+        Ok(PublishPreflight::New)
     }
 
     pub fn history(&self, session_id: Uuid, now_ms: i64) -> Result<Vec<RetainedClip>, CoreError> {
@@ -1552,6 +1571,10 @@ mod tests {
         let message_id = Uuid::new_v4();
         let input = publish_input(message_id, 1, "once");
         let first = core.publish(source.session_id, input.clone(), NOW).unwrap();
+        assert_eq!(
+            core.preflight_publish(source.session_id, 1, message_id, NOW + 1),
+            Ok(PublishPreflight::Retained)
+        );
         let retry = core.publish(source.session_id, input, NOW + 1).unwrap();
         assert_eq!(retry.cursor, first.cursor);
         assert!(retry.duplicate);
@@ -1561,6 +1584,10 @@ mod tests {
             Err(CoreError::Failure(FailureCode::MessageIdConflict))
         );
         core.history(source.session_id, NOW + 60_000).unwrap();
+        assert_eq!(
+            core.preflight_publish(source.session_id, 1, message_id, NOW + 60_000),
+            Err(CoreError::Failure(FailureCode::MessageIdReplay))
+        );
         assert_eq!(
             core.publish(
                 source.session_id,

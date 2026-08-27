@@ -1,0 +1,26 @@
+{
+  "contract_version": "r3-localapi-compatibility-v1",
+  "status": {
+    "TailscaleIPs": ["100.64.0.7"],
+    "BackendState": "Running",
+    "Self": {},
+    "Peer": {},
+    "User": {},
+    "CurrentTailnet": {},
+    "Health": [],
+    "MagicDNSSuffix": "example.invalid.",
+    "CertDomains": [],
+    "Version": "test",
+    "TUN": true,
+    "HaveNodeKey": true,
+    "AuthURL": "",
+    "ExitNodeStatus": {},
+    "ExtraRecords": [],
+    "ClientVersion": {}
+  },
+  "whois": {
+    "Node": {"StableID": "peer-reserved-example", "Name": "peer.example.invalid."},
+    "UserProfile": {"ID": 1, "LoginName": "reserved@example.invalid"},
+    "CapMap": {"https://tailscale.com/cap/example": []}
+  }
+}

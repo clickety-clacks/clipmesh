@@ -74,6 +74,11 @@ impl SystemLocalApi {
                     | "CertDomains"
                     | "Version"
                     | "TUN"
+                    | "HaveNodeKey"
+                    | "AuthURL"
+                    | "ExitNodeStatus"
+                    | "ExtraRecords"
+                    | "ClientVersion"
             )
         }) {
             return Err(LocalApiError::MalformedResponse);
@@ -1248,8 +1253,12 @@ impl HubEdge {
         require_version(input.protocol_version)?;
         let event = input.event;
         let clear_generation = parse_u64(event.clear_generation)?;
+        // Classify the scalar identity before inspecting the opaque content
+        // fields.  In particular, a retired message ID remains a replay even
+        // when a peer retries it with an unreadable payload.
+        let message_id = parse_uuid(event.message_id)?;
         self.core
-            .validate_publish_context(session_id, clear_generation)
+            .preflight_publish(session_id, clear_generation, message_id, now_ms)
             .map_err(|error| EdgeFailure(core_error(error)))?;
         let content = ClipContentV1::from_wire(
             &event.content_type,
@@ -1263,7 +1272,7 @@ impl HubEdge {
             .publish(
                 session_id,
                 PublishInput {
-                    message_id: parse_uuid(event.message_id)?,
+                    message_id,
                     clear_generation,
                     created_at_ms: event.created_at_ms,
                     content,
@@ -1864,7 +1873,7 @@ mod tests {
                             } else if target.starts_with("/localapi/v0/status") {
                                 let body = if state.documented_shape {
                                     format!(
-                                        r#"{{"TailscaleIPs":["{}"],"BackendState":"Running","Version":"test"}}"#,
+                                        r#"{{"TailscaleIPs":["{}"],"BackendState":"Running","Self":{{}},"Peer":{{}},"User":{{}},"CurrentTailnet":{{}},"Health":[],"MagicDNSSuffix":"example.invalid.","CertDomains":[],"Version":"test","TUN":true,"HaveNodeKey":true,"AuthURL":"","ExitNodeStatus":{{}},"ExtraRecords":[],"ClientVersion":{{}}}}"#,
                                         state.address
                                     )
                                 } else {
@@ -2197,6 +2206,38 @@ mod tests {
                 .unwrap_err()
                 .0,
             EdgeError::ClearGenerationStale
+        );
+    }
+
+    #[test]
+    fn publish_preflight_classifies_identity_and_tombstones_before_payload_decoding() {
+        let (_directory, _daemon, edge) = edge();
+        let source = live(&edge);
+        let message_id = "00000000-0000-4000-8000-000000000006";
+        edge.handle_text(
+            source,
+            &format!(r#"{{"protocol_version":1,"type":"publish","event":{{"message_id":"{message_id}","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}}}"#),
+            NOW,
+        )
+        .unwrap();
+        edge.handle_text(source, r#"{"protocol_version":1,"type":"clear_history","request_id":"00000000-0000-4000-8000-000000000007","expected_clear_generation":"1"}"#, NOW).unwrap();
+        let retry = live(&edge);
+        let replay_with_bad_payload = format!(
+            r#"{{"protocol_version":1,"type":"publish","event":{{"message_id":"{message_id}","clear_generation":"2","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":1,"content_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_b64":"!"}}}}"#
+        );
+        assert_eq!(
+            edge.handle_text(retry, &replay_with_bad_payload, NOW)
+                .unwrap_err()
+                .0,
+            EdgeError::MessageIdReplay
+        );
+
+        let malformed_id_with_bad_payload = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"not-a-uuid","clear_generation":"2","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":1,"content_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_b64":"!"}}"#;
+        assert_eq!(
+            edge.handle_text(retry, malformed_id_with_bad_payload, NOW)
+                .unwrap_err()
+                .0,
+            EdgeError::ProtocolSchemaInvalid
         );
     }
 

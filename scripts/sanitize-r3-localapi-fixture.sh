@@ -13,10 +13,14 @@ output=$2
 
 if command -v jq >/dev/null 2>&1; then
   jq '
-    if (keys == ["TailscaleIPs"]) and (.TailscaleIPs | type == "array") and (.TailscaleIPs | all(type == "string" and length > 0)) then
-      {TailscaleIPs: (.TailscaleIPs | map("[redacted]"))}
-    elif (keys == ["Node"]) and (.Node | type == "object") and (.Node | keys == ["StableID"]) and (.Node.StableID | type == "string" and length > 0) then
-      {Node: {StableID: "[redacted]"}}
+    def status_fields: ["TailscaleIPs", "BackendState", "Self", "Peer", "User", "CurrentTailnet", "Health", "MagicDNSSuffix", "CertDomains", "Version", "TUN", "HaveNodeKey", "AuthURL", "ExitNodeStatus", "ExtraRecords", "ClientVersion"];
+    def whois_fields: ["Node", "UserProfile", "CapMap"];
+    def only_fields($allowed):
+      [keys[] as $key | select($allowed | index($key) | not)] | length == 0;
+    if (type == "object") and only_fields(status_fields) and (has("TailscaleIPs")) and (.TailscaleIPs | type == "array") and (.TailscaleIPs | all(type == "string" and length > 0)) then
+      {contract_version: "r3-localapi-compatibility-v1", kind: "status", TailscaleIPs: (.TailscaleIPs | map("[redacted]"))}
+    elif (type == "object") and only_fields(whois_fields) and (has("Node")) and (.Node | type == "object") and (.Node.StableID | type == "string" and length > 0) and ((has("UserProfile") | not) or (.UserProfile | type == "object")) and ((has("CapMap") | not) or (.CapMap | type == "object")) then
+      {contract_version: "r3-localapi-compatibility-v1", kind: "whois", Node: {StableID: "[redacted]"}}
     else error("unexpected LocalAPI schema") end
   ' "$input" >"$output"
 else
