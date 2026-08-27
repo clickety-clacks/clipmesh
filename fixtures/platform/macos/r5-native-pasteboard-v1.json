@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "pasteboard_kind": "isolated_unique_native",
+  "local_bytes_utf8": "clipmesh-local-capture",
+  "local_declared_types": [
+    "public.utf8-plain-text",
+    "NSStringPboardType",
+    "com.example.unverified"
+  ],
+  "local_hint": "Ordinary",
+  "local_revision_current_before_remote": true,
+  "remote_bytes_utf8": "clipmesh-remote-capture\nline-two",
+  "remote_revision_current": true,
+  "change_count_monotonic": true,
+  "lock_state": "Locked"
+}

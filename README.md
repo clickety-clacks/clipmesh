@@ -27,5 +27,7 @@ complete WebSocket-frame output. It has no executable or default listener.
 The hub core provides SQLite-only ordering, retry, resume, acknowledgement,
 retention, shared clear, and canonical clip-content custody.
 
-Platform adapters, mobile, packaging, deployment, listener activation, and
-private topology remain outside this repository slice.
+The macOS native pasteboard and lock-state adapter, owner-only Unix control
+seam, and inactive generic launchd template are present. The Linux adapter,
+packaging, deployment, listener activation, and private topology remain
+outside this repository slice.

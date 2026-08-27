@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.clipmesh-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@CLIPMESH_AGENT_BINARY@@</string>
+    <string>--config</string>
+    <string>@@CLIPMESH_CONFIG_PATH@@</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLIPMESH_HUB_URL</key>
+    <string>@@CLIPMESH_HUB_URL@@</string>
+    <key>CLIPMESH_STATE_PATH</key>
+    <string>@@CLIPMESH_STATE_PATH@@</string>
+    <key>CLIPMESH_CONTROL_SOCKET</key>
+    <string>@@CLIPMESH_CONTROL_SOCKET@@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
