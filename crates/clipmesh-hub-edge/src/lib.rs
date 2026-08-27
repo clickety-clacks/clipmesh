@@ -32,6 +32,16 @@ const MAX_HEADERS: usize = 16_384;
 const SYSTEM_LOCALAPI_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 const LOCALAPI_RESPONSE_LIMIT: usize = 131_072;
 
+/// The upstream LocalAPI response contract that this adapter supports.
+///
+/// This is Tailscale v1.100.0 at commit c811bb19bf3b0c89061ac7b7a073f6cd23b504d0.
+/// That revision defines `ipnstate.Status` and `apitype.WhoIsResponse` with
+/// every top-level field admitted below. A later daemon response must fail
+/// closed until the contract is deliberately reviewed again.
+pub const TAILSCALE_LOCALAPI_COMPATIBILITY_VERSION: &str = "v1.100.0";
+pub const TAILSCALE_LOCALAPI_COMPATIBILITY_REVISION: &str =
+    "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0";
+
 /// Concrete owner of the host-local Tailscale daemon socket.
 ///
 /// It has no TCP fallback and deliberately returns only the two values the
@@ -74,6 +84,11 @@ impl SystemLocalApi {
                     | "CertDomains"
                     | "Version"
                     | "TUN"
+                    | "HaveNodeKey"
+                    | "AuthURL"
+                    | "ExitNodeStatus"
+                    | "ExtraRecords"
+                    | "ClientVersion"
             )
         }) {
             return Err(LocalApiError::MalformedResponse);
@@ -1248,8 +1263,12 @@ impl HubEdge {
         require_version(input.protocol_version)?;
         let event = input.event;
         let clear_generation = parse_u64(event.clear_generation)?;
+        // Classify the scalar identity before inspecting the opaque content
+        // fields.  In particular, a retired message ID remains a replay even
+        // when a peer retries it with an unreadable payload.
+        let message_id = parse_uuid(event.message_id)?;
         self.core
-            .validate_publish_context(session_id, clear_generation)
+            .preflight_publish(session_id, clear_generation, message_id, now_ms)
             .map_err(|error| EdgeFailure(core_error(error)))?;
         let content = ClipContentV1::from_wire(
             &event.content_type,
@@ -1263,7 +1282,7 @@ impl HubEdge {
             .publish(
                 session_id,
                 PublishInput {
-                    message_id: parse_uuid(event.message_id)?,
+                    message_id,
                     clear_generation,
                     created_at_ms: event.created_at_ms,
                     content,
@@ -1819,6 +1838,12 @@ mod tests {
     use tempfile::tempdir;
 
     const NOW: i64 = 1_700_000_000_000;
+    const LOCALAPI_COMPATIBILITY_CONTRACT: &str =
+        include_str!("../tests/fixtures/r3-localapi-compatibility-v1.json");
+
+    fn compatibility_contract() -> Value {
+        serde_json::from_str(LOCALAPI_COMPATIBILITY_CONTRACT).unwrap()
+    }
 
     #[derive(Clone)]
     struct LocalApiSimulator {
@@ -1863,19 +1888,19 @@ mod tests {
                                 (503, "{}".to_owned())
                             } else if target.starts_with("/localapi/v0/status") {
                                 let body = if state.documented_shape {
-                                    format!(
-                                        r#"{{"TailscaleIPs":["{}"],"BackendState":"Running","Version":"test"}}"#,
-                                        state.address
-                                    )
+                                    let mut contract = compatibility_contract();
+                                    contract["status"]["TailscaleIPs"] =
+                                        json!([state.address.to_string()]);
+                                    serde_json::to_string(&contract["status"]).unwrap()
                                 } else {
                                     format!(r#"{{"TailscaleIPs":["{}"]}}"#, state.address)
                                 };
                                 (200, body)
                             } else if let Some(peer) = state.peer {
                                 let body = if state.documented_shape {
-                                    format!(
-                                        r#"{{"Node":{{"StableID":"{peer}","Name":"peer.example.invalid."}},"UserProfile":{{}},"CapMap":{{}}}}"#
-                                    )
+                                    let mut contract = compatibility_contract();
+                                    contract["whois"]["Node"]["StableID"] = json!(peer);
+                                    serde_json::to_string(&contract["whois"]).unwrap()
                                 } else {
                                     format!(r#"{{"Node":{{"StableID":"{peer}"}}}}"#)
                                 };
@@ -2087,6 +2112,21 @@ mod tests {
     }
 
     #[test]
+    fn localapi_compatibility_contract_pins_the_upstream_release_and_revision() {
+        let contract = compatibility_contract();
+        assert_eq!(
+            contract["upstream"]["release"],
+            TAILSCALE_LOCALAPI_COMPATIBILITY_VERSION
+        );
+        assert_eq!(
+            contract["upstream"]["revision"],
+            TAILSCALE_LOCALAPI_COMPATIBILITY_REVISION
+        );
+        assert_eq!(contract["upstream"]["status_type"], "ipnstate.Status");
+        assert_eq!(contract["upstream"]["whois_type"], "apitype.WhoIsResponse");
+    }
+
+    #[test]
     fn websocket_failures_use_typed_v1_outcomes_and_exact_close_policy() {
         let publish = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"00000000-0000-4000-8000-000000000099"}}"#;
         let rejected = websocket_failure_frame(Some(publish), EdgeError::PublishRateLimited);
@@ -2197,6 +2237,38 @@ mod tests {
                 .unwrap_err()
                 .0,
             EdgeError::ClearGenerationStale
+        );
+    }
+
+    #[test]
+    fn publish_preflight_classifies_identity_and_tombstones_before_payload_decoding() {
+        let (_directory, _daemon, edge) = edge();
+        let source = live(&edge);
+        let message_id = "00000000-0000-4000-8000-000000000006";
+        edge.handle_text(
+            source,
+            &format!(r#"{{"protocol_version":1,"type":"publish","event":{{"message_id":"{message_id}","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}}}"#),
+            NOW,
+        )
+        .unwrap();
+        edge.handle_text(source, r#"{"protocol_version":1,"type":"clear_history","request_id":"00000000-0000-4000-8000-000000000007","expected_clear_generation":"1"}"#, NOW).unwrap();
+        let retry = live(&edge);
+        let replay_with_bad_payload = format!(
+            r#"{{"protocol_version":1,"type":"publish","event":{{"message_id":"{message_id}","clear_generation":"2","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":1,"content_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_b64":"!"}}}}"#
+        );
+        assert_eq!(
+            edge.handle_text(retry, &replay_with_bad_payload, NOW)
+                .unwrap_err()
+                .0,
+            EdgeError::MessageIdReplay
+        );
+
+        let malformed_id_with_bad_payload = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"not-a-uuid","clear_generation":"2","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":1,"content_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_b64":"!"}}"#;
+        assert_eq!(
+            edge.handle_text(retry, malformed_id_with_bad_payload, NOW)
+                .unwrap_err()
+                .0,
+            EdgeError::ProtocolSchemaInvalid
         );
     }
 

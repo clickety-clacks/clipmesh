@@ -1,0 +1,31 @@
+{
+  "upstream": {
+    "release": "v1.100.0",
+    "revision": "c811bb19bf3b0c89061ac7b7a073f6cd23b504d0",
+    "status_type": "ipnstate.Status",
+    "whois_type": "apitype.WhoIsResponse"
+  },
+  "status": {
+    "TailscaleIPs": ["100.64.0.7"],
+    "BackendState": "Running",
+    "Self": {},
+    "Peer": {},
+    "User": {},
+    "CurrentTailnet": {},
+    "Health": [],
+    "MagicDNSSuffix": "example.invalid.",
+    "CertDomains": [],
+    "Version": "test",
+    "TUN": true,
+    "HaveNodeKey": true,
+    "AuthURL": "",
+    "ExitNodeStatus": {},
+    "ExtraRecords": [],
+    "ClientVersion": {}
+  },
+  "whois": {
+    "Node": {"StableID": "peer-reserved-example", "Name": "peer.example.invalid."},
+    "UserProfile": {"ID": 1, "LoginName": "reserved@example.invalid"},
+    "CapMap": {}
+  }
+}
