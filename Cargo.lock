@@ -68,10 +68,21 @@ name = "clipmesh-agent-core"
 version = "0.1.0"
 dependencies = [
  "base64",
- "clipmesh-protocol",
+ "clipmesh-hub-core",
  "libc",
  "rusqlite",
- "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "clipmesh-hub-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "rusqlite",
  "sha2",
  "tempfile",
  "thiserror",

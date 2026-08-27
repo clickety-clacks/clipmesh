@@ -1,22 +1,35 @@
-//! Persistent desktop-agent domain logic.
+//! Persistent, transport-neutral desktop-agent domain logic.
 //!
 //! Platform adapters and transports call this crate. It owns no operating-system
-//! clipboard integration, listener, credential, enrollment, or deployment code.
+//! clipboard integration, listener, identity, enrollment, or deployment code.
 
 mod store;
 
-use std::path::Path;
+use std::{fmt, path::Path};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use clipmesh_protocol::{ClipboardEventV1, Delivery, FailureCode, LimitsV1, U64Decimal, UuidV4};
-use sha2::{Digest, Sha256};
+pub use clipmesh_hub_core::{ClipContentV1, WireContentV1};
 use store::StateStore;
 use thiserror::Error;
 use uuid::Uuid;
 
+const HARD_MAX_PAYLOAD_BYTES: usize = 1_048_576;
 const OUTBOX_MAX_EVENTS: usize = 20;
 const OUTBOX_MAX_BYTES: usize = 1_048_576;
 const ACK_INTERVAL_MS: i64 = 2_000;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishEventV1 {
+    pub message_id: Uuid,
+    pub clear_generation: u64,
+    pub created_at_ms: i64,
+    pub content: ClipContentV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Delivery {
+    Resume,
+    Live,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentState {
@@ -25,38 +38,70 @@ pub enum AgentState {
     ActiveUnlockedLive,
     Locked,
     LocallyPaused,
-    AdministrativelyPaused,
     OutboxFull,
     AdapterFailed,
     Stopping,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SessionParameters {
-    pub history_epoch: UuidV4,
-    pub limits: LimitsV1,
+    pub self_peer_id: String,
+    pub history_epoch: Uuid,
+    pub clear_generation: u64,
+    pub max_payload_bytes: usize,
+    pub retention_seconds: u64,
     pub server_time_offset_ms: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalObservation {
-    pub bytes: Vec<u8>,
-    pub sensitive: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HintClassification {
+    Ordinary,
+    Confidential,
+    Transient,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct PlatformRevision(String);
+
+impl PlatformRevision {
+    pub fn synthetic(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub(crate) fn storage_value(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn from_storage(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for PlatformRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PlatformRevision([redacted])")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct LocalObservation {
+    pub bytes: Vec<u8>,
+    pub revision: PlatformRevision,
+    pub hint: HintClassification,
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObservationToken {
-    generation: u64,
+    state_generation: u64,
     observation: LocalObservation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationSuppression {
-    Inactive,
     StateChanged,
-    Sensitive,
+    StaleNotification,
+    ExplicitHint,
     LocalOnly,
-    ConsecutiveDuplicate,
     RemoteWriteLoop,
     InvalidPayload,
     OutboxFull,
@@ -70,44 +115,55 @@ pub enum ObservationResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutboxItem {
-    pub event: ClipboardEventV1,
+    pub event: PublishEventV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopMarker {
-    pub message_id: UuidV4,
-    pub content_sha256: String,
+    pub message_id: Uuid,
+    pub content: ClipContentV1,
+    pub revision: PlatformRevision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentSnapshot {
-    pub highest_source_seq: u64,
-    pub history_epoch: Option<UuidV4>,
-    pub last_cursor: Option<U64Decimal>,
+    pub history_epoch: Option<Uuid>,
+    pub clear_generation: Option<u64>,
+    pub last_cursor: Option<u64>,
     pub outbox: Vec<OutboxItem>,
     pub loop_marker: Option<LoopMarker>,
     pub processed_message_count: usize,
+    pub history_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ReceivedEvent {
-    pub history_epoch: UuidV4,
-    pub cursor: U64Decimal,
+    pub history_epoch: Uuid,
+    pub clear_generation: u64,
+    pub cursor: u64,
     pub delivery: Delivery,
-    pub event: ClipboardEventV1,
+    pub accepted_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub source_peer_id: String,
+    pub message_id: Uuid,
+    pub created_at_ms: i64,
+    pub content_type: String,
+    pub payload_b64: String,
+    pub payload_bytes: usize,
+    pub content_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveResult {
     RecordedOnly,
-    ClipboardAlreadyEqual,
     Applied,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AckCursor {
-    pub history_epoch: UuidV4,
-    pub cursor: U64Decimal,
+    pub history_epoch: Uuid,
+    pub clear_generation: u64,
+    pub cursor: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,15 +171,32 @@ pub enum LocalControl {
     Status,
     Pause,
     Resume,
-    ClearLocalCache,
+    ClearLocalHistory,
     LocalOnlyNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermanentPublishFailure {
+    Validation,
+    Replay,
+    StaleGeneration,
+}
+
+impl PermanentPublishFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Validation => "publish_validation_failed",
+            Self::Replay => "message_id_replay",
+            Self::StaleGeneration => "clear_generation_stale",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Status {
     pub state: AgentState,
     pub outbox_events: usize,
-    pub sensitive_suppressions: u64,
+    pub hinted_suppressions: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -159,18 +232,24 @@ impl ReconnectBackoff {
 }
 
 pub trait ClipboardAdapter {
-    fn current_bytes(&mut self) -> Result<Vec<u8>, FailureCode>;
-    fn write_text(&mut self, text: &str) -> Result<(), FailureCode>;
+    fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError>;
+    fn write_text(&mut self, bytes: &[u8]) -> Result<PlatformRevision, AdapterError>;
 }
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("adapter_unavailable")]
+pub struct AdapterError;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CoreError {
+    #[error("state_path_insecure")]
+    StatePathInsecure,
     #[error("local_state_unavailable")]
     LocalStateUnavailable,
-    #[error("device_sequence_exhausted")]
-    DeviceSequenceExhausted,
     #[error("session_epoch_stale")]
     SessionEpochStale,
+    #[error("clear_generation_stale")]
+    ClearGenerationStale,
     #[error("cursor_ahead")]
     CursorOrderInvalid,
     #[error("protocol_schema_invalid")]
@@ -179,44 +258,45 @@ pub enum CoreError {
     AdapterUnavailable,
     #[error("protocol_schema_invalid")]
     InvalidTransition,
+    #[error("content_type_unsupported")]
+    ContentTypeUnsupported,
+    #[error("payload_encoding_invalid")]
+    PayloadEncodingInvalid,
+    #[error("payload_empty")]
+    PayloadEmpty,
+    #[error("payload_too_large")]
+    PayloadTooLarge,
+    #[error("payload_length_mismatch")]
+    PayloadLengthMismatch,
+    #[error("payload_hash_mismatch")]
+    PayloadHashMismatch,
 }
 
 pub struct AgentCore {
     store: StateStore,
-    device_id: UuidV4,
     state: AgentState,
-    generation: u64,
+    state_generation: u64,
     session: Option<SessionParameters>,
     local_only_next: bool,
-    prior_local_hash: Option<String>,
     pending_ack: Option<AckCursor>,
     last_ack_sent_at_ms: Option<i64>,
-    sensitive_suppressions: u64,
+    hinted_suppressions: u64,
 }
 
 impl AgentCore {
-    /// Creates a new state store during explicit device initialization.
-    pub fn initialize(path: &Path, device_id: UuidV4) -> Result<Self, CoreError> {
-        Self::with_store(StateStore::initialize(path)?, device_id)
-    }
-
-    /// Opens an existing enrolled device. A missing store is a loud failure.
-    pub fn open(path: &Path, device_id: UuidV4) -> Result<Self, CoreError> {
-        Self::with_store(StateStore::open(path)?, device_id)
-    }
-
-    fn with_store(store: StateStore, device_id: UuidV4) -> Result<Self, CoreError> {
+    /// Opens version 1 state or initializes it when the database is absent.
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let mut store = StateStore::open_or_initialize(path)?;
+        store.clear_loop_marker()?;
         Ok(Self {
             store,
-            device_id,
             state: AgentState::StartingUnknownLock,
-            generation: 0,
+            state_generation: 0,
             session: None,
             local_only_next: false,
-            prior_local_hash: None,
             pending_ack: None,
             last_ack_sent_at_ms: None,
-            sensitive_suppressions: 0,
+            hinted_suppressions: 0,
         })
     }
 
@@ -230,19 +310,42 @@ impl AgentCore {
 
     pub fn start_unlocked(&mut self) {
         if self.state == AgentState::StartingUnknownLock {
-            self.transition(AgentState::ActiveUnlockedConnecting, true);
+            self.transition(AgentState::ActiveUnlockedConnecting);
         }
     }
 
     pub fn set_session(&mut self, parameters: SessionParameters) -> Result<(), CoreError> {
-        if !matches!(
-            self.state,
-            AgentState::ActiveUnlockedConnecting | AgentState::AdministrativelyPaused
-        ) {
+        if self.state != AgentState::ActiveUnlockedConnecting {
             return Err(CoreError::InvalidTransition);
         }
+        if parameters.self_peer_id.is_empty()
+            || parameters.history_epoch.get_version_num() != 4
+            || parameters.max_payload_bytes == 0
+            || parameters.max_payload_bytes > HARD_MAX_PAYLOAD_BYTES
+            || parameters.retention_seconds == 0
+        {
+            return Err(CoreError::InvalidEvent);
+        }
+        let snapshot = self.store.snapshot()?;
+        match snapshot.clear_generation {
+            Some(generation) if parameters.clear_generation < generation => {
+                return Err(CoreError::ClearGenerationStale);
+            }
+            Some(generation) if parameters.clear_generation > generation => {
+                self.store.apply_generation_change(
+                    &parameters.history_epoch,
+                    parameters.clear_generation,
+                    None,
+                )?
+            }
+            Some(_) if snapshot.history_epoch != Some(parameters.history_epoch) => self
+                .store
+                .apply_epoch_change(&parameters.history_epoch, parameters.clear_generation)?,
+            _ => self
+                .store
+                .establish_context(&parameters.history_epoch, parameters.clear_generation)?,
+        }
         self.session = Some(parameters);
-        self.state = AgentState::ActiveUnlockedConnecting;
         self.last_ack_sent_at_ms = None;
         Ok(())
     }
@@ -262,60 +365,64 @@ impl AgentCore {
             self.state,
             AgentState::ActiveUnlockedLive | AgentState::OutboxFull
         ) {
-            self.transition(AgentState::ActiveUnlockedConnecting, true);
+            self.transition(AgentState::ActiveUnlockedConnecting);
         }
-    }
-
-    pub fn administratively_paused(&mut self) {
-        self.session = None;
-        self.pending_ack = None;
-        self.transition(AgentState::AdministrativelyPaused, true);
     }
 
     pub fn set_locked(&mut self, locked: bool) {
         if locked {
             self.session = None;
             self.pending_ack = None;
-            self.transition(AgentState::Locked, true);
+            self.transition(AgentState::Locked);
         } else if self.state == AgentState::Locked {
-            self.transition(AgentState::ActiveUnlockedConnecting, true);
+            self.transition(AgentState::ActiveUnlockedConnecting);
         }
     }
 
     pub fn adapter_failed(&mut self) {
         self.session = None;
         self.pending_ack = None;
-        self.transition(AgentState::AdapterFailed, true);
+        self.transition(AgentState::AdapterFailed);
     }
 
     pub fn stop(&mut self) {
         self.session = None;
         self.pending_ack = None;
-        self.transition(AgentState::Stopping, true);
+        self.transition(AgentState::Stopping);
     }
 
     pub fn begin_observation(&self, observation: LocalObservation) -> Option<ObservationToken> {
         (self.state == AgentState::ActiveUnlockedLive).then_some(ObservationToken {
-            generation: self.generation,
+            state_generation: self.state_generation,
             observation,
         })
     }
 
-    pub fn commit_observation(
+    pub fn commit_observation<A: ClipboardAdapter>(
         &mut self,
         token: ObservationToken,
         local_utc_ms: i64,
+        adapter: &mut A,
     ) -> Result<ObservationResult, CoreError> {
-        if token.generation != self.generation || self.state != AgentState::ActiveUnlockedLive {
+        if token.state_generation != self.state_generation
+            || self.state != AgentState::ActiveUnlockedLive
+        {
             return Ok(ObservationResult::Suppressed(
                 ObservationSuppression::StateChanged,
             ));
         }
-        let session = self.session.as_ref().ok_or(CoreError::InvalidEvent)?;
-        if token.observation.sensitive {
-            self.sensitive_suppressions = self.sensitive_suppressions.saturating_add(1);
+        if !adapter
+            .is_current(&token.observation.revision)
+            .map_err(|_| CoreError::AdapterUnavailable)?
+        {
             return Ok(ObservationResult::Suppressed(
-                ObservationSuppression::Sensitive,
+                ObservationSuppression::StaleNotification,
+            ));
+        }
+        if token.observation.hint != HintClassification::Ordinary {
+            self.hinted_suppressions = self.hinted_suppressions.saturating_add(1);
+            return Ok(ObservationResult::Suppressed(
+                ObservationSuppression::ExplicitHint,
             ));
         }
         if self.local_only_next {
@@ -325,37 +432,46 @@ impl AgentCore {
             ));
         }
 
-        let content_hash = sha256_hex(&token.observation.bytes);
-        if self.prior_local_hash.as_deref() == Some(content_hash.as_str()) {
-            return Ok(ObservationResult::Suppressed(
-                ObservationSuppression::ConsecutiveDuplicate,
-            ));
-        }
-        self.prior_local_hash = Some(content_hash.clone());
+        let session = self.session.as_ref().ok_or(CoreError::InvalidTransition)?;
+        let content =
+            match ClipContentV1::from_platform(&token.observation.bytes, session.max_payload_bytes)
+                .map_err(map_content_error)
+            {
+                Ok(content) => content,
+                Err(
+                    CoreError::PayloadEmpty
+                    | CoreError::PayloadEncodingInvalid
+                    | CoreError::PayloadTooLarge,
+                ) => {
+                    return Ok(ObservationResult::Suppressed(
+                        ObservationSuppression::InvalidPayload,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
 
         if let Some(marker) = self.store.snapshot()?.loop_marker {
-            self.store.clear_loop_marker()?;
-            if marker.content_sha256 == content_hash {
-                return Ok(ObservationResult::Suppressed(
-                    ObservationSuppression::RemoteWriteLoop,
-                ));
+            if token.observation.revision == marker.revision {
+                if content.same_content(&marker.content) {
+                    return Ok(ObservationResult::Suppressed(
+                        ObservationSuppression::RemoteWriteLoop,
+                    ));
+                }
+                self.adapter_failed();
+                return Err(CoreError::AdapterUnavailable);
             }
-        }
-
-        if token.observation.bytes.is_empty()
-            || std::str::from_utf8(&token.observation.bytes).is_err()
-            || token.observation.bytes.len() > session.limits.max_payload_bytes as usize
-        {
-            return Ok(ObservationResult::Suppressed(
-                ObservationSuppression::InvalidPayload,
-            ));
+            self.store.clear_loop_marker()?;
         }
 
         let created_at_ms = local_utc_ms.saturating_add(session.server_time_offset_ms);
-        self.store.remove_expired(created_at_ms)?;
+        self.store.remove_stale_outbox(
+            created_at_ms,
+            session.retention_seconds,
+            session.clear_generation,
+        )?;
         let (count, bytes) = self.store.outbox_usage()?;
         if count >= OUTBOX_MAX_EVENTS
-            || bytes.saturating_add(token.observation.bytes.len()) > OUTBOX_MAX_BYTES
+            || bytes.saturating_add(content.as_storage_blob().len()) > OUTBOX_MAX_BYTES
         {
             self.state = AgentState::OutboxFull;
             return Ok(ObservationResult::Suppressed(
@@ -363,47 +479,40 @@ impl AgentCore {
             ));
         }
 
-        let source_seq = self
-            .store
-            .snapshot()?
-            .highest_source_seq
-            .checked_add(1)
-            .ok_or(CoreError::DeviceSequenceExhausted)?;
-        let event = build_event(
-            &self.device_id,
-            source_seq,
+        let event = PublishEventV1 {
+            message_id: Uuid::new_v4(),
+            clear_generation: session.clear_generation,
             created_at_ms,
-            session.limits.retention_seconds,
-            &token.observation.bytes,
-            &content_hash,
-        )?;
-        self.store.insert_outbox(source_seq, &event)?;
+            content,
+        };
+        self.store.insert_outbox(&event)?;
         Ok(ObservationResult::Queued(OutboxItem { event }))
     }
 
     pub fn outbox_for_retry(&self) -> Result<Vec<OutboxItem>, CoreError> {
+        if !matches!(
+            self.state,
+            AgentState::ActiveUnlockedLive | AgentState::OutboxFull
+        ) {
+            return Ok(Vec::new());
+        }
         self.store.outbox_items()
     }
 
-    pub fn publish_accepted(&mut self, message_id: &UuidV4) -> Result<(), CoreError> {
+    pub fn publish_accepted(&mut self, message_id: Uuid) -> Result<(), CoreError> {
         self.store.remove_outbox(message_id)?;
-        self.leave_outbox_full_if_possible()?;
-        Ok(())
-    }
-
-    pub fn expire_outbox(&mut self, now_ms: i64) -> Result<usize, CoreError> {
-        let expired = self.store.remove_expired(now_ms)?;
-        self.leave_outbox_full_if_possible()?;
-        Ok(expired)
+        self.leave_outbox_full_if_possible()
     }
 
     pub fn publish_rejected(
         &mut self,
-        message_id: &UuidV4,
-        code: FailureCode,
+        message_id: Uuid,
+        failure: PermanentPublishFailure,
+        retryable: bool,
     ) -> Result<(), CoreError> {
-        if !code.retryable() {
-            self.store.remove_outbox(message_id)?;
+        if !retryable {
+            self.store
+                .record_publish_failure(message_id, failure.code())?;
             self.leave_outbox_full_if_possible()?;
         }
         Ok(())
@@ -415,94 +524,105 @@ impl AgentCore {
         local_utc_ms: i64,
         adapter: &mut A,
     ) -> Result<ReceiveResult, CoreError> {
-        let session = self.session.as_ref().ok_or(CoreError::SessionEpochStale)?;
+        let session = self.session.as_ref().ok_or(CoreError::InvalidTransition)?;
         if received.history_epoch != session.history_epoch {
             return Err(CoreError::SessionEpochStale);
         }
-        let delivery_is_valid = matches!(
-            (self.state, &received.delivery),
+        if received.clear_generation != session.clear_generation {
+            return Err(CoreError::ClearGenerationStale);
+        }
+        if received.cursor == 0
+            || received.message_id.get_version_num() != 4
+            || received.source_peer_id.is_empty()
+            || received.expires_at_ms <= local_utc_ms
+        {
+            return Err(CoreError::InvalidEvent);
+        }
+        let valid_state = matches!(
+            (self.state, received.delivery),
             (AgentState::ActiveUnlockedConnecting, Delivery::Resume)
                 | (AgentState::ActiveUnlockedLive, Delivery::Live)
                 | (AgentState::OutboxFull, Delivery::Live)
         );
-        if !delivery_is_valid {
+        if !valid_state {
             return Err(CoreError::InvalidTransition);
         }
         let snapshot = self.store.snapshot()?;
-        if let Some(cursor) = snapshot.last_cursor {
-            if received.cursor <= cursor {
-                return Err(CoreError::CursorOrderInvalid);
-            }
+        if snapshot
+            .last_cursor
+            .is_some_and(|cursor| received.cursor <= cursor)
+        {
+            return Err(CoreError::CursorOrderInvalid);
         }
-        received
-            .event
-            .validate(
-                local_utc_ms.saturating_add(session.server_time_offset_ms),
-                session.limits.max_payload_bytes,
-                session.limits.retention_seconds,
-            )
-            .map_err(|_| CoreError::InvalidEvent)?;
-        let already_processed = self.store.has_processed(&received.event.message_id)?;
-        let should_apply = received.delivery == Delivery::Live
-            && received.event.source_device_id != self.device_id
-            && !already_processed
+        let content = ClipContentV1::from_wire(
+            &received.content_type,
+            &received.payload_b64,
+            received.payload_bytes,
+            &received.content_sha256,
+            session.max_payload_bytes,
+        )
+        .map_err(map_content_error)?;
+        let already_processed = self.store.has_processed(received.message_id)?;
+        let apply = !already_processed
+            && received.delivery == Delivery::Live
+            && received.source_peer_id != session.self_peer_id
             && self.state == AgentState::ActiveUnlockedLive;
 
-        let mut result = ReceiveResult::RecordedOnly;
-        let mut marker = None;
-        if should_apply {
-            let bytes = received
-                .event
-                .payload_b64
-                .decode_wire_bytes()
-                .map_err(|_| CoreError::InvalidEvent)?;
-            let current = adapter
-                .current_bytes()
+        let marker = if apply {
+            let revision = adapter
+                .write_text(content.to_platform())
                 .map_err(|_| CoreError::AdapterUnavailable)?;
-            if current == bytes {
-                result = ReceiveResult::ClipboardAlreadyEqual;
-            } else {
-                let text = std::str::from_utf8(&bytes).map_err(|_| CoreError::InvalidEvent)?;
-                adapter
-                    .write_text(text)
-                    .map_err(|_| CoreError::AdapterUnavailable)?;
-                marker = Some(LoopMarker {
-                    message_id: clone_uuid(&received.event.message_id)?,
-                    content_sha256: sha256_hex(&bytes),
-                });
-                result = ReceiveResult::Applied;
-            }
-        }
-        self.store.record_received(
-            &received.history_epoch,
-            received.cursor,
-            &received.event.message_id,
-            marker.as_ref(),
-        )?;
+            Some(LoopMarker {
+                message_id: received.message_id,
+                content: content.clone(),
+                revision,
+            })
+        } else {
+            None
+        };
+        self.store
+            .record_received(&received, &content, marker.as_ref())?;
         self.pending_ack = Some(AckCursor {
             history_epoch: received.history_epoch,
+            clear_generation: received.clear_generation,
             cursor: received.cursor,
         });
-        Ok(result)
+        Ok(if apply {
+            ReceiveResult::Applied
+        } else {
+            ReceiveResult::RecordedOnly
+        })
     }
 
     pub fn poll_ack(&mut self, now_ms: i64) -> Option<AckCursor> {
         self.take_ack(now_ms, false)
     }
 
-    pub fn purge_notice(
+    pub fn clear_notice(
         &mut self,
-        history_epoch: &UuidV4,
-        purged_through_cursor: Option<U64Decimal>,
+        history_epoch: Uuid,
+        clear_generation: u64,
+        cleared_through_cursor: Option<u64>,
     ) -> Result<(), CoreError> {
-        self.generation = self.generation.wrapping_add(1);
-        self.store
-            .apply_purge(history_epoch, purged_through_cursor)?;
-        if let Some(session) = self.session.as_mut() {
-            session.history_epoch = clone_uuid(history_epoch)?;
+        let current = self
+            .store
+            .snapshot()?
+            .clear_generation
+            .ok_or(CoreError::InvalidTransition)?;
+        if clear_generation <= current {
+            return Err(CoreError::ClearGenerationStale);
         }
-        self.prior_local_hash = None;
+        self.store.apply_generation_change(
+            &history_epoch,
+            clear_generation,
+            cleared_through_cursor,
+        )?;
+        if let Some(session) = self.session.as_mut() {
+            session.history_epoch = history_epoch;
+            session.clear_generation = clear_generation;
+        }
         self.pending_ack = None;
+        self.state_generation = self.state_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -512,19 +632,14 @@ impl AgentCore {
             LocalControl::Pause => {
                 self.session = None;
                 self.pending_ack = None;
-                self.transition(AgentState::LocallyPaused, true);
+                self.transition(AgentState::LocallyPaused);
             }
             LocalControl::Resume => {
                 if self.state == AgentState::LocallyPaused {
-                    self.transition(AgentState::ActiveUnlockedConnecting, true);
+                    self.transition(AgentState::ActiveUnlockedConnecting);
                 }
             }
-            LocalControl::ClearLocalCache => {
-                self.generation = self.generation.wrapping_add(1);
-                self.store.clear_local_cache()?;
-                self.prior_local_hash = None;
-                self.pending_ack = None;
-            }
+            LocalControl::ClearLocalHistory => self.store.clear_local_history()?,
             LocalControl::LocalOnlyNext => self.local_only_next = true,
         }
         self.status()
@@ -534,7 +649,7 @@ impl AgentCore {
         Ok(Status {
             state: self.state,
             outbox_events: self.store.outbox_usage()?.0,
-            sensitive_suppressions: self.sensitive_suppressions,
+            hinted_suppressions: self.hinted_suppressions,
         })
     }
 
@@ -544,11 +659,9 @@ impl AgentCore {
         random_sample % (ceiling + 1)
     }
 
-    fn transition(&mut self, state: AgentState, cancel_observation: bool) {
+    fn transition(&mut self, state: AgentState) {
         self.state = state;
-        if cancel_observation {
-            self.generation = self.generation.wrapping_add(1);
-        }
+        self.state_generation = self.state_generation.wrapping_add(1);
     }
 
     fn leave_outbox_full_if_possible(&mut self) -> Result<(), CoreError> {
@@ -580,38 +693,18 @@ impl AgentCore {
     }
 }
 
-fn build_event(
-    device_id: &UuidV4,
-    source_seq: u64,
-    created_at_ms: i64,
-    retention_seconds: u64,
-    bytes: &[u8],
-    content_hash: &str,
-) -> Result<ClipboardEventV1, CoreError> {
-    let event = serde_json::json!({
-        "message_id": Uuid::new_v4().to_string(),
-        "source_device_id": device_id.get().to_string(),
-        "source_seq": source_seq.to_string(),
-        "created_at_ms": created_at_ms,
-        "expires_at_ms": created_at_ms.saturating_add(
-            retention_seconds.saturating_mul(1000).min(i64::MAX as u64) as i64
-        ),
-        "content_type": "text/plain",
-        "payload_bytes": bytes.len(),
-        "content_sha256": content_hash,
-        "payload_b64": URL_SAFE_NO_PAD.encode(bytes),
-    });
-    serde_json::from_value(event).map_err(|_| CoreError::InvalidEvent)
-}
+fn map_content_error(error: clipmesh_hub_core::CoreError) -> CoreError {
+    use clipmesh_hub_core::FailureCode;
 
-fn clone_uuid(value: &UuidV4) -> Result<UuidV4, CoreError> {
-    serde_json::from_value(serde_json::Value::String(value.get().to_string()))
-        .map_err(|_| CoreError::InvalidEvent)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    match error {
+        clipmesh_hub_core::CoreError::Failure(code) => match code {
+            FailureCode::ContentTypeUnsupported => CoreError::ContentTypeUnsupported,
+            FailureCode::PayloadEncodingInvalid => CoreError::PayloadEncodingInvalid,
+            FailureCode::PayloadEmpty => CoreError::PayloadEmpty,
+            FailureCode::PayloadTooLarge => CoreError::PayloadTooLarge,
+            FailureCode::PayloadLengthMismatch => CoreError::PayloadLengthMismatch,
+            FailureCode::PayloadHashMismatch => CoreError::PayloadHashMismatch,
+            _ => CoreError::InvalidEvent,
+        },
+    }
 }
