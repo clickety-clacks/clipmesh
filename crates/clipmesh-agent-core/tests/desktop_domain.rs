@@ -734,6 +734,21 @@ fn outbox_read_failure_enters_terminal_inactive_state() {
 }
 
 #[test]
+fn status_read_failure_enters_terminal_inactive_state() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    Connection::open(path)
+        .unwrap()
+        .execute("DROP TABLE outbox", [])
+        .unwrap();
+    assert_eq!(agent.status(), Err(CoreError::LocalStateUnavailable));
+    assert_eq!(agent.state(), AgentState::Stopping);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"later", "later"))
+        .is_none());
+}
+
+#[test]
 fn live_cursor_gap_changes_no_state_and_is_never_acked_past() {
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);

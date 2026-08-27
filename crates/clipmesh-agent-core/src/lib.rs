@@ -685,10 +685,12 @@ impl AgentCore {
         self.status()
     }
 
-    pub fn status(&self) -> Result<Status, CoreError> {
+    pub fn status(&mut self) -> Result<Status, CoreError> {
+        let usage = self.store.outbox_usage();
+        let outbox_events = self.fail_closed_on_store_error(usage)?.0;
         Ok(Status {
             state: self.state,
-            outbox_events: self.store.outbox_usage()?.0,
+            outbox_events,
             hinted_suppressions: self.hinted_suppressions,
         })
     }
