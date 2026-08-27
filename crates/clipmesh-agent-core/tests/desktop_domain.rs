@@ -768,6 +768,29 @@ fn expired_resume_advances_cursor_without_history_or_platform_write() {
 }
 
 #[test]
+fn malformed_expired_resume_changes_no_state() {
+    let (_directory, path) = state_path();
+    let mut agent = connecting_agent(&path);
+    let mut clipboard = SyntheticClipboard::default();
+    let mut event = received(1, Delivery::Resume, REMOTE_PEER, b"expired");
+    event.expires_at_ms = NOW - 1;
+    event.content_type = "image/png".to_owned();
+    event.payload_b64 = "%%%".to_owned();
+    event.payload_bytes = 999;
+    event.content_sha256 = "invalid".to_owned();
+    assert_eq!(
+        agent.receive_event(event, NOW, &mut clipboard),
+        Err(CoreError::ContentTypeUnsupported)
+    );
+    let snapshot = agent.snapshot().unwrap();
+    assert_eq!(snapshot.last_cursor, None);
+    assert_eq!(snapshot.history_count, 0);
+    assert_eq!(snapshot.processed_message_count, 0);
+    assert!(clipboard.writes.is_empty());
+    assert!(agent.finish_resume(NOW).is_none());
+}
+
+#[test]
 fn live_cursor_gap_changes_no_state_and_is_never_acked_past() {
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);

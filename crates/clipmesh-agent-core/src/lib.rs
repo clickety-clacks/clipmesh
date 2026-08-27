@@ -584,6 +584,14 @@ impl AgentCore {
             if received.delivery != Delivery::Resume {
                 return Err(CoreError::InvalidEvent);
             }
+            ClipContentV1::from_wire(
+                &received.content_type,
+                &received.payload_b64,
+                received.payload_bytes,
+                &received.content_sha256,
+                session.max_payload_bytes,
+            )
+            .map_err(map_content_error)?;
             let recorded = self.store.record_cursor(&received);
             self.fail_closed_on_store_error(recorded)?;
             self.pending_ack = Some(AckCursor {
