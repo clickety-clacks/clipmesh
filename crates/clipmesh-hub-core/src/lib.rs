@@ -288,6 +288,14 @@ pub struct SessionHello {
     pub newest_cursor: Option<u64>,
 }
 
+/// Content-free queue accounting for an edge's slow-consumer boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionQueueMetrics {
+    pub events: usize,
+    /// Conservative encoded-frame upper bound; this never exposes payloads.
+    pub wire_upper_bound_bytes: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishInput {
     pub message_id: Uuid,
@@ -677,6 +685,34 @@ impl HubCore {
         Ok(Some(SessionEventLease { state, session_id }))
     }
 
+    /// Returns content-free queue bounds while holding the same state seam as
+    /// event enqueueing. The edge uses this to close slow consumers before its
+    /// transport can retain an unbounded backlog.
+    pub fn session_queue_metrics(
+        &self,
+        session_id: Uuid,
+    ) -> Result<SessionQueueMetrics, CoreError> {
+        let state = self.state.lock().expect("hub state lock poisoned");
+        let session = state
+            .sessions
+            .get(&session_id)
+            .ok_or(CoreError::Failure(FailureCode::SessionContextStale))?;
+        let wire_upper_bound_bytes = session
+            .queue
+            .iter()
+            .map(|event| match event {
+                SessionEvent::ResumeClip(clip) | SessionEvent::Live(clip) => {
+                    4096 + 4 * clip.content.as_storage_blob().len().div_ceil(3)
+                }
+                _ => 1024,
+            })
+            .sum();
+        Ok(SessionQueueMetrics {
+            events: session.queue.len(),
+            wire_upper_bound_bytes,
+        })
+    }
+
     pub fn publish(
         &self,
         session_id: Uuid,
@@ -744,6 +780,23 @@ impl HubCore {
         };
         enqueue_clip(&mut state, session_id, accepted.clone(), clip);
         Ok(accepted)
+    }
+
+    /// Checks the publish state boundary before an edge decodes payload bytes.
+    ///
+    /// A malformed payload must not mask a stale session or clear generation.
+    /// The edge calls this at ingress and `publish` repeats the same checks at
+    /// its serialized mutation point to close the intervening-state race.
+    pub fn validate_publish_context(
+        &self,
+        session_id: Uuid,
+        clear_generation: u64,
+    ) -> Result<(), CoreError> {
+        let state = self.state.lock().expect("hub state lock poisoned");
+        require_session_exists(&state, session_id)?;
+        compare_generation(clear_generation, state.clear_generation)?;
+        require_live_session(&state, session_id)?;
+        Ok(())
     }
 
     pub fn history(&self, session_id: Uuid, now_ms: i64) -> Result<Vec<RetainedClip>, CoreError> {
