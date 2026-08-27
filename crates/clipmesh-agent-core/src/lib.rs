@@ -411,10 +411,14 @@ impl AgentCore {
                 ObservationSuppression::StateChanged,
             ));
         }
-        if !adapter
-            .is_current(&token.observation.revision)
-            .map_err(|_| CoreError::AdapterUnavailable)?
-        {
+        let observation_is_current = match adapter.is_current(&token.observation.revision) {
+            Ok(is_current) => is_current,
+            Err(_) => {
+                self.adapter_failed();
+                return Err(CoreError::AdapterUnavailable);
+            }
+        };
+        if !observation_is_current {
             return Ok(ObservationResult::Suppressed(
                 ObservationSuppression::StaleNotification,
             ));
@@ -554,6 +558,13 @@ impl AgentCore {
         {
             return Err(CoreError::CursorOrderInvalid);
         }
+        if received.delivery == Delivery::Live
+            && snapshot
+                .last_cursor
+                .is_some_and(|cursor| cursor.checked_add(1) != Some(received.cursor))
+        {
+            return Err(CoreError::CursorOrderInvalid);
+        }
         let content = ClipContentV1::from_wire(
             &received.content_type,
             &received.payload_b64,
@@ -569,9 +580,13 @@ impl AgentCore {
             && self.state == AgentState::ActiveUnlockedLive;
 
         let marker = if apply {
-            let revision = adapter
-                .write_text(content.to_platform())
-                .map_err(|_| CoreError::AdapterUnavailable)?;
+            let revision = match adapter.write_text(content.to_platform()) {
+                Ok(revision) => revision,
+                Err(_) => {
+                    self.adapter_failed();
+                    return Err(CoreError::AdapterUnavailable);
+                }
+            };
             Some(LoopMarker {
                 message_id: received.message_id,
                 content: content.clone(),
@@ -580,8 +595,16 @@ impl AgentCore {
         } else {
             None
         };
-        self.store
-            .record_received(&received, &content, marker.as_ref())?;
+        if let Err(error) = self
+            .store
+            .record_received(&received, &content, marker.as_ref())
+        {
+            // A successful platform write cannot be rolled back. Stop every
+            // observable seam before returning the storage failure so no
+            // watcher echo or same-session redelivery can follow it.
+            self.stop();
+            return Err(error);
+        }
         self.pending_ack = Some(AckCursor {
             history_epoch: received.history_epoch,
             clear_generation: received.clear_generation,

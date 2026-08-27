@@ -21,6 +21,9 @@ struct SyntheticClipboard {
     current_revision: Option<PlatformRevision>,
     writes: Vec<Vec<u8>>,
     next_write: u64,
+    fail_current: bool,
+    fail_write: bool,
+    drop_history_after_write: Option<PathBuf>,
 }
 
 impl SyntheticClipboard {
@@ -37,14 +40,26 @@ impl SyntheticClipboard {
 
 impl ClipboardAdapter for SyntheticClipboard {
     fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError> {
+        if self.fail_current {
+            return Err(AdapterError);
+        }
         Ok(self.current_revision.as_ref() == Some(revision))
     }
 
     fn write_text(&mut self, bytes: &[u8]) -> Result<PlatformRevision, AdapterError> {
+        if self.fail_write {
+            return Err(AdapterError);
+        }
         self.next_write += 1;
         let revision = PlatformRevision::synthetic(format!("remote-{}", self.next_write));
         self.current_revision = Some(revision.clone());
         self.writes.push(bytes.to_vec());
+        if let Some(path) = self.drop_history_after_write.take() {
+            Connection::open(path)
+                .unwrap()
+                .execute("DROP TABLE history", [])
+                .unwrap();
+        }
         Ok(revision)
     }
 }
@@ -412,7 +427,41 @@ fn state_path_failures_are_distinct_and_unsupported_schema_is_byte_identical() {
             AgentCore::open(&symlink_path).err().unwrap(),
             CoreError::StatePathInsecure
         );
+
+        let broad_file = directory.path().join("broad-file.sqlite3");
+        drop(AgentCore::open(&broad_file).unwrap());
+        std::fs::set_permissions(&broad_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let broad_file_before = std::fs::read(&broad_file).unwrap();
+        assert_eq!(
+            AgentCore::open(&broad_file).err().unwrap(),
+            CoreError::StatePathInsecure
+        );
+        assert_eq!(std::fs::read(&broad_file).unwrap(), broad_file_before);
+
+        let read_only = directory.path().join("read-only.sqlite3");
+        drop(AgentCore::open(&read_only).unwrap());
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let read_only_before = std::fs::read(&read_only).unwrap();
+        assert_eq!(
+            AgentCore::open(&read_only).err().unwrap(),
+            CoreError::LocalStateUnavailable
+        );
+        assert_eq!(std::fs::read(&read_only).unwrap(), read_only_before);
     }
+
+    let corrupt = directory.path().join("corrupt.sqlite3");
+    std::fs::write(&corrupt, b"not a SQLite database").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let corrupt_before = std::fs::read(&corrupt).unwrap();
+    assert_eq!(
+        AgentCore::open(&corrupt).err().unwrap(),
+        CoreError::LocalStateUnavailable
+    );
+    assert_eq!(std::fs::read(&corrupt).unwrap(), corrupt_before);
 }
 
 #[test]
@@ -511,6 +560,120 @@ fn reconnect_generation_change_deletes_old_state_and_rejects_rollback() {
         Err(CoreError::ClearGenerationStale)
     );
     assert_eq!(agent.snapshot().unwrap().clear_generation, Some(2));
+}
+
+#[test]
+fn adapter_errors_make_the_agent_inactive_until_external_repair() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    let observation = clipboard.observe(b"local", "local-error");
+    let token = agent.begin_observation(observation).unwrap();
+    clipboard.fail_current = true;
+    assert_eq!(
+        agent.commit_observation(token, NOW, &mut clipboard),
+        Err(CoreError::AdapterUnavailable)
+    );
+    assert_eq!(agent.state(), AgentState::AdapterFailed);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"later", "later"))
+        .is_none());
+
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    clipboard.fail_write = true;
+    assert_eq!(
+        agent.receive_event(
+            received(1, Delivery::Live, REMOTE_PEER, b"remote"),
+            NOW,
+            &mut clipboard,
+        ),
+        Err(CoreError::AdapterUnavailable)
+    );
+    assert_eq!(agent.state(), AgentState::AdapterFailed);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"later", "later"))
+        .is_none());
+}
+
+#[test]
+fn post_write_storage_failure_stops_every_observable_seam() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    clipboard.drop_history_after_write = Some(path);
+    assert_eq!(
+        agent.receive_event(
+            received(1, Delivery::Live, REMOTE_PEER, b"remote"),
+            NOW,
+            &mut clipboard,
+        ),
+        Err(CoreError::LocalStateUnavailable)
+    );
+    assert_eq!(clipboard.writes, [b"remote".to_vec()]);
+    assert_eq!(agent.state(), AgentState::Stopping);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"remote", "remote-1"))
+        .is_none());
+    assert!(agent.outbox_for_retry().unwrap().is_empty());
+}
+
+#[test]
+fn live_cursor_gap_changes_no_state_and_is_never_acked_past() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    agent
+        .receive_event(
+            received(1, Delivery::Live, REMOTE_PEER, b"one"),
+            NOW,
+            &mut clipboard,
+        )
+        .unwrap();
+    assert_eq!(agent.poll_ack(NOW).unwrap().cursor, 1);
+    assert_eq!(
+        agent.receive_event(
+            received(3, Delivery::Live, REMOTE_PEER, b"three"),
+            NOW + 2_000,
+            &mut clipboard,
+        ),
+        Err(CoreError::CursorOrderInvalid)
+    );
+    assert_eq!(agent.snapshot().unwrap().last_cursor, Some(1));
+    assert!(agent.poll_ack(NOW + 2_000).is_none());
+    assert_eq!(clipboard.writes, [b"one".to_vec()]);
+}
+
+#[test]
+fn epoch_change_preserves_the_process_lifetime_loop_marker() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    agent
+        .receive_event(
+            received(1, Delivery::Live, REMOTE_PEER, b"remote"),
+            NOW,
+            &mut clipboard,
+        )
+        .unwrap();
+    agent.disconnect();
+    let mut next = session();
+    next.history_epoch = Uuid::parse_str("00000000-0000-4000-8000-000000000004").unwrap();
+    agent.set_session(next).unwrap();
+    assert!(agent.snapshot().unwrap().loop_marker.is_some());
+    agent.finish_resume(NOW + 1);
+
+    let echo = agent
+        .begin_observation(LocalObservation {
+            bytes: b"remote".to_vec(),
+            revision: PlatformRevision::synthetic("remote-1"),
+            hint: HintClassification::Ordinary,
+        })
+        .unwrap();
+    assert_eq!(
+        agent
+            .commit_observation(echo, NOW + 2, &mut clipboard)
+            .unwrap(),
+        ObservationResult::Suppressed(ObservationSuppression::RemoteWriteLoop)
+    );
+    assert!(agent.snapshot().unwrap().loop_marker.is_some());
+    assert!(agent.snapshot().unwrap().outbox.is_empty());
 }
 
 fn state_path() -> (TempDir, PathBuf) {

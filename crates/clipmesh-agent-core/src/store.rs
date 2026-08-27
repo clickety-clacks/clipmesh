@@ -219,8 +219,7 @@ impl StateStore {
         transaction
             .execute_batch(
                 "DELETE FROM history;
-                 DELETE FROM processed_message;
-                 DELETE FROM loop_marker;",
+                 DELETE FROM processed_message;",
             )
             .map_err(|_| CoreError::LocalStateUnavailable)?;
         set_metadata(&transaction, "history_epoch", &history_epoch.to_string())?;
