@@ -440,7 +440,10 @@ impl StateStore {
         let transaction = self.transaction()?;
         transaction
             .execute(
-                "DELETE FROM outbox WHERE clear_generation < ?1",
+                "DELETE FROM outbox
+                 WHERE LENGTH(clear_generation) < LENGTH(?1)
+                    OR (LENGTH(clear_generation) = LENGTH(?1)
+                        AND clear_generation < ?1 COLLATE BINARY)",
                 [clear_generation.to_string()],
             )
             .map_err(|_| CoreError::LocalStateUnavailable)?;

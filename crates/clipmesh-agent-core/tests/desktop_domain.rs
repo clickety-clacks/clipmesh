@@ -582,6 +582,34 @@ fn reconnect_generation_change_deletes_old_state_and_rejects_rollback() {
 }
 
 #[test]
+fn generation_width_change_deletes_pre_clear_outbox_content() {
+    let (_directory, path) = state_path();
+    let mut agent = AgentCore::open(&path).unwrap();
+    agent.start_unlocked();
+    let mut generation_nine = session();
+    generation_nine.clear_generation = 9;
+    agent.set_session(generation_nine).unwrap();
+    agent.finish_resume(NOW);
+    let mut clipboard = SyntheticClipboard::default();
+    queue(
+        &mut agent,
+        &mut clipboard,
+        b"generation nine",
+        "generation-nine",
+        NOW,
+    );
+    assert_eq!(agent.snapshot().unwrap().outbox.len(), 1);
+
+    agent.disconnect();
+    let mut generation_ten = session();
+    generation_ten.clear_generation = 10;
+    agent.set_session(generation_ten).unwrap();
+    assert!(agent.snapshot().unwrap().outbox.is_empty());
+    agent.finish_resume(NOW + 1);
+    assert!(agent.outbox_for_retry().unwrap().is_empty());
+}
+
+#[test]
 fn adapter_errors_make_the_agent_inactive_until_external_repair() {
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);
