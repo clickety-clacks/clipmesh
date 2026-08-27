@@ -1,0 +1,68 @@
+name: ClipMesh
+
+options:
+  deploymentTarget:
+    iOS: "26.0"
+  groupSortPosition: top
+
+settings:
+  base:
+    CLANG_WARN_DOCUMENTATION_COMMENTS: YES
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGN_IDENTITY: ""
+    ENABLE_STRICT_OBJC_MSGSEND: YES
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_VERSION: 6.2
+
+targets:
+  ClipMesh:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - App/Info.plist
+    settings:
+      base:
+        CODE_SIGN_IDENTITY: ""
+        CURRENT_PROJECT_VERSION: 1
+        INFOPLIST_FILE: Sources/App/Info.plist
+        MARKETING_VERSION: 0.1.0
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.ClipMesh
+        PRODUCT_NAME: ClipMesh
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  ClipMeshTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+        excludes:
+          - Fixtures
+      - path: Tests/Fixtures
+        buildPhase: resources
+      - path: ../../fixtures/protocol/publish-v1.json
+        buildPhase: resources
+    dependencies:
+      - target: ClipMesh
+    settings:
+      base:
+        CODE_SIGN_IDENTITY: ""
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.ClipMeshTests
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ClipMesh.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ClipMesh"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
+schemes:
+  ClipMesh:
+    build:
+      targets:
+        ClipMesh: all
+        ClipMeshTests: [test]
+    test:
+      gatherCoverageData: true
+      targets:
+        - ClipMeshTests
