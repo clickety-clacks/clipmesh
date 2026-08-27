@@ -118,6 +118,12 @@ impl SystemLocalApi {
         {
             return Err(LocalApiError::MalformedResponse);
         }
+        if ["UserProfile", "CapMap"]
+            .into_iter()
+            .any(|field| object.get(field).is_some_and(|value| !value.is_object()))
+        {
+            return Err(LocalApiError::MalformedResponse);
+        }
         value
             .get("Node")
             .and_then(Value::as_object)
@@ -1856,6 +1862,7 @@ mod tests {
         peer: Option<&'static str>,
         address: IpAddr,
         documented_shape: bool,
+        malformed_whois_shape: bool,
         requests: Vec<String>,
     }
 
@@ -1870,6 +1877,7 @@ mod tests {
                 peer: Some("peer-reserved-example"),
                 address: "100.64.0.7".parse().unwrap(),
                 documented_shape: false,
+                malformed_whois_shape: false,
                 requests: Vec::new(),
             }));
             let server_state = Arc::clone(&state);
@@ -1900,6 +1908,10 @@ mod tests {
                                 let body = if state.documented_shape {
                                     let mut contract = compatibility_contract();
                                     contract["whois"]["Node"]["StableID"] = json!(peer);
+                                    if state.malformed_whois_shape {
+                                        contract["whois"]["UserProfile"] = json!("malformed");
+                                        contract["whois"]["CapMap"] = json!([]);
+                                    }
                                     serde_json::to_string(&contract["whois"]).unwrap()
                                 } else {
                                     format!(r#"{{"Node":{{"StableID":"{peer}"}}}}"#)
@@ -2108,6 +2120,19 @@ mod tests {
                 .who_is("100.64.0.9:12345".parse().unwrap())
                 .unwrap(),
             "peer-reserved-example"
+        );
+    }
+
+    #[test]
+    fn malformed_whois_profile_or_capabilities_fail_the_pinned_contract() {
+        let daemon = LocalApiSimulator::admitted();
+        let mut state = daemon.state.lock().unwrap();
+        state.documented_shape = true;
+        state.malformed_whois_shape = true;
+        drop(state);
+        assert_eq!(
+            daemon.client().who_is("100.64.0.9:12345".parse().unwrap()),
+            Err(LocalApiError::MalformedResponse)
         );
     }
 
