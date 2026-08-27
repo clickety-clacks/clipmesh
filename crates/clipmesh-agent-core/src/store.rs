@@ -379,6 +379,22 @@ impl StateStore {
         commit(transaction)
     }
 
+    pub(crate) fn record_cursor(&mut self, received: &ReceivedEvent) -> Result<(), CoreError> {
+        let transaction = self.transaction()?;
+        set_metadata(
+            &transaction,
+            "history_epoch",
+            &received.history_epoch.to_string(),
+        )?;
+        set_metadata(
+            &transaction,
+            "clear_generation",
+            &received.clear_generation.to_string(),
+        )?;
+        set_metadata(&transaction, "last_cursor", &received.cursor.to_string())?;
+        commit(transaction)
+    }
+
     pub(crate) fn replace_loop_marker(&mut self, marker: &LoopMarker) -> Result<(), CoreError> {
         let transaction = self.transaction()?;
         transaction

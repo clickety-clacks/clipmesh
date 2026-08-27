@@ -749,6 +749,25 @@ fn status_read_failure_enters_terminal_inactive_state() {
 }
 
 #[test]
+fn expired_resume_advances_cursor_without_history_or_platform_write() {
+    let (_directory, path) = state_path();
+    let mut agent = connecting_agent(&path);
+    let mut clipboard = SyntheticClipboard::default();
+    let mut event = received(1, Delivery::Resume, REMOTE_PEER, b"expired");
+    event.expires_at_ms = NOW - 1;
+    assert_eq!(
+        agent.receive_event(event, NOW, &mut clipboard),
+        Ok(ReceiveResult::RecordedOnly)
+    );
+    let snapshot = agent.snapshot().unwrap();
+    assert_eq!(snapshot.last_cursor, Some(1));
+    assert_eq!(snapshot.history_count, 0);
+    assert_eq!(snapshot.processed_message_count, 0);
+    assert!(clipboard.writes.is_empty());
+    assert_eq!(agent.finish_resume(NOW).unwrap().cursor, 1);
+}
+
+#[test]
 fn live_cursor_gap_changes_no_state_and_is_never_acked_past() {
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);

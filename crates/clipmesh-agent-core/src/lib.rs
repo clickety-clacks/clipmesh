@@ -553,7 +553,6 @@ impl AgentCore {
         if received.cursor == 0
             || received.message_id.get_version_num() != 4
             || received.source_peer_id.is_empty()
-            || received.expires_at_ms <= local_utc_ms
         {
             return Err(CoreError::InvalidEvent);
         }
@@ -580,6 +579,19 @@ impl AgentCore {
                 .is_some_and(|cursor| cursor.checked_add(1) != Some(received.cursor))
         {
             return Err(CoreError::CursorOrderInvalid);
+        }
+        if received.expires_at_ms <= local_utc_ms {
+            if received.delivery != Delivery::Resume {
+                return Err(CoreError::InvalidEvent);
+            }
+            let recorded = self.store.record_cursor(&received);
+            self.fail_closed_on_store_error(recorded)?;
+            self.pending_ack = Some(AckCursor {
+                history_epoch: received.history_epoch,
+                clear_generation: received.clear_generation,
+                cursor: received.cursor,
+            });
+            return Ok(ReceiveResult::RecordedOnly);
         }
         let content = ClipContentV1::from_wire(
             &received.content_type,
