@@ -16,10 +16,13 @@ its canonical reviewed specification reference.
 
 ## Status
 
-The immutable Rust protocol foundation and the remediated transport-neutral hub
-policy core are present. The hub core accepts a stable peer ID from a later
-Tailnet edge and provides SQLite-only ordering, retry, resume, acknowledgement,
+The immutable Rust protocol foundation, the remediated transport-neutral hub
+policy core, and a dormant Tailnet edge are present. The edge validates a
+configured Tailnet self address through LocalAPI, resolves each accepted
+socket with WhoIs before HTTP parsing, and holds the hub event lease through
+complete WebSocket-frame output. It has no executable or default listener.
+The hub core provides SQLite-only ordering, retry, resume, acknowledgement,
 retention, shared clear, and canonical clip-content custody.
 
-LocalAPI, transport, desktop, mobile, packaging, deployment, listeners, and
-private topology remain outside this repository slice.
+Desktop, mobile, packaging, deployment, listener activation, and private
+topology remain outside this repository slice.

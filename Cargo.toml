@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/clipmesh-hub-core", "crates/clipmesh-protocol"]
+members = [
+    "crates/clipmesh-hub-core",
+    "crates/clipmesh-hub-edge",
+    "crates/clipmesh-protocol",
+]
 resolver = "2"
 
 [workspace.package]

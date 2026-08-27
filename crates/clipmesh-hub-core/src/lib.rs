@@ -501,6 +501,15 @@ impl HubCore {
             .history_epoch
     }
 
+    pub fn newest_cursor(&self) -> Option<u64> {
+        nonzero(
+            self.state
+                .lock()
+                .expect("hub state lock poisoned")
+                .cursor_high_water,
+        )
+    }
+
     pub fn clear_generation(&self) -> u64 {
         self.state
             .lock()
@@ -531,6 +540,20 @@ impl HubCore {
             clear_generation: state.clear_generation,
             newest_cursor: nonzero(state.cursor_high_water),
         }
+    }
+
+    /// Releases a transport session after its edge has stopped output.
+    ///
+    /// The edge calls this only after it has stopped the socket. Removing the
+    /// session at the state seam makes a subsequent session-limit admission
+    /// reflect actual connected writers rather than stale transport state.
+    pub fn close_session(&self, session_id: Uuid) -> Result<(), CoreError> {
+        let mut state = self.state.lock().expect("hub state lock poisoned");
+        state
+            .sessions
+            .remove(&session_id)
+            .map(|_| ())
+            .ok_or(CoreError::Failure(FailureCode::SessionContextStale))
     }
 
     pub fn begin_resume(
