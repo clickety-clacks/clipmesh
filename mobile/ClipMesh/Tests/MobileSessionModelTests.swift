@@ -134,6 +134,28 @@ final class MobileSessionModelTests: XCTestCase {
         model.deactivate()
     }
 
+    func testEmptyResumeDoesNotAcknowledgeAnUnsentBoundary() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(newestCursor: 5),
+            ProtocolFixtures.resumeStarted(status: "fresh", boundaryCursor: 5),
+            ProtocolFixtures.resumeComplete(boundary: 5),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(
+            transport: transport,
+            pasteboard: SyntheticPasteboardWriter(),
+            preferences: preferences,
+            now: { ProtocolFixtures.now },
+        )
+
+        model.activate()
+        try await waitForLive(model)
+
+        XCTAssertEqual(messageCount("ack", in: transport), 0)
+        model.deactivate()
+    }
+
     func testReconnectGenerationCatchUpWritesOnlyTheFirstLaterLiveRemoteClip() async throws {
         let transport = SyntheticClipTransport(incoming: [
             ProtocolFixtures.hello(generation: 1, newestCursor: 1),
@@ -200,6 +222,50 @@ final class MobileSessionModelTests: XCTestCase {
         )
         try await waitUntil("post-clear live write") { pasteboard.writes.count == 1 }
         XCTAssertTrue(pasteboard.writes.first == "synthetic after clear")
+        model.deactivate()
+    }
+
+    func testLaterLiveEventPrunesExpiredVisibleHistory() async throws {
+        var currentTime = ProtocolFixtures.now
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(),
+            ProtocolFixtures.resumeStarted(),
+            ProtocolFixtures.resumeComplete(boundary: nil),
+            ProtocolFixtures.event(
+                delivery: "live",
+                cursor: 1,
+                messageSuffix: "000000000016",
+                sourcePeerID: "peer-reserved-source",
+                text: "synthetic expiring first",
+            ),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(
+            transport: transport,
+            pasteboard: SyntheticPasteboardWriter(),
+            preferences: preferences,
+            now: { currentTime },
+        )
+
+        model.activate()
+        try await waitUntil("first live row") { model.visibleHistory.map(\.cursor) == [1] }
+
+        currentTime = Date(timeIntervalSince1970: 1_700_604_801)
+        transport.enqueue(
+            ProtocolFixtures.event(
+                delivery: "live",
+                cursor: 2,
+                messageSuffix: "000000000017",
+                sourcePeerID: "peer-reserved-source",
+                text: "synthetic unexpired second",
+                acceptedAtMilliseconds: 1_700_604_801_000,
+                expiresAtMilliseconds: 1_701_209_601_000,
+            ),
+        )
+        try await waitUntil("second live row") { model.visibleHistory.first?.cursor == 2 }
+
+        XCTAssertEqual(model.visibleHistory.map(\.cursor), [2])
         model.deactivate()
     }
 

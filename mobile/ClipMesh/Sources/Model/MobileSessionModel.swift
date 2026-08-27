@@ -332,6 +332,7 @@ final class MobileSessionModel {
             guard lifecycleState == .foregroundLive else {
                 throw ProtocolFailure.protocolSchemaInvalid
             }
+            pruneExpiredHistory()
             if isUnexpired, value.sourcePeerID != selfPeerID {
                 try pasteboard.write(value.content)
             }
@@ -370,9 +371,6 @@ final class MobileSessionModel {
         }
         if let boundary = value.boundaryCursor, let lastCursor, lastCursor > boundary {
             throw ProtocolFailure.cursorAhead
-        }
-        if let boundary = value.boundaryCursor {
-            lastCursor = max(lastCursor ?? 0, boundary)
         }
         storedHistory = storedHistory.map { clip in
             var current = clip
