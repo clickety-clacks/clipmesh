@@ -201,14 +201,7 @@ impl OwnerControlSocket {
         if peer_uid(&stream)? != self.owner_uid {
             return Err(MacAdapterError::StatePathInsecure);
         }
-        let mut bytes = [0_u8; MAX_CONTROL_BYTES + 1];
-        let count = stream
-            .read(&mut bytes)
-            .map_err(|_| MacAdapterError::ControlRequestInvalid)?;
-        if count == 0 || count > MAX_CONTROL_BYTES {
-            return Err(MacAdapterError::ControlRequestInvalid);
-        }
-        let command = ControlCommand::parse(&bytes[..count])?;
+        let command = read_control_command(&mut stream)?;
         Ok((stream, command))
     }
 
@@ -228,6 +221,28 @@ impl OwnerControlSocket {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn read_control_command(reader: &mut impl Read) -> Result<ControlCommand, MacAdapterError> {
+    // This one-request connection is complete only at write-side EOF; stream writes are not frames.
+    let mut bytes = [0_u8; MAX_CONTROL_BYTES + 1];
+    let mut count = 0;
+    loop {
+        let read = reader
+            .read(&mut bytes[count..])
+            .map_err(|_| MacAdapterError::ControlRequestInvalid)?;
+        if read == 0 {
+            break;
+        }
+        count += read;
+        if count > MAX_CONTROL_BYTES {
+            return Err(MacAdapterError::ControlRequestInvalid);
+        }
+    }
+    if count == 0 {
+        return Err(MacAdapterError::ControlRequestInvalid);
+    }
+    ControlCommand::parse(&bytes[..count])
 }
 
 impl Drop for OwnerControlSocket {
@@ -617,8 +632,21 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, os::unix::net::UnixStream, thread};
+    use std::{collections::VecDeque, io, net::Shutdown, os::unix::net::UnixStream, thread};
     use tempfile::TempDir;
+
+    struct ChunkedReader(VecDeque<Vec<u8>>);
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.0.pop_front() else {
+                return Ok(0);
+            };
+            assert!(chunk.len() <= output.len());
+            output[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
 
     struct SequenceLockState(VecDeque<LockState>);
 
@@ -686,6 +714,40 @@ mod tests {
     }
 
     #[test]
+    fn control_request_accepts_one_complete_command_split_across_reads() {
+        let mut reader = ChunkedReader(VecDeque::from([
+            b"local-".to_vec(),
+            b"only-".to_vec(),
+            b"next\n".to_vec(),
+        ]));
+        assert_eq!(
+            read_control_command(&mut reader),
+            Ok(ControlCommand::LocalOnlyNext)
+        );
+    }
+
+    #[test]
+    fn control_request_rejects_trailing_bytes_after_a_valid_prefix() {
+        let mut reader = ChunkedReader(VecDeque::from([
+            b"pause\n".to_vec(),
+            b"trailing\n".to_vec(),
+        ]));
+        assert_eq!(
+            read_control_command(&mut reader),
+            Err(MacAdapterError::ControlRequestInvalid)
+        );
+    }
+
+    #[test]
+    fn control_request_rejects_an_oversized_frame() {
+        let mut reader = ChunkedReader(VecDeque::from([vec![b'x'; MAX_CONTROL_BYTES + 1]]));
+        assert_eq!(
+            read_control_command(&mut reader),
+            Err(MacAdapterError::ControlRequestInvalid)
+        );
+    }
+
+    #[test]
     fn owner_control_socket_accepts_only_closed_commands() {
         let directory = TempDir::new().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -695,6 +757,7 @@ mod tests {
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(client_path).unwrap();
             stream.write_all(b"shared-clear\n").unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             response
