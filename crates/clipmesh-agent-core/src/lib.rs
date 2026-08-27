@@ -504,14 +504,15 @@ impl AgentCore {
         Ok(ObservationResult::Queued(OutboxItem { event }))
     }
 
-    pub fn outbox_for_retry(&self) -> Result<Vec<OutboxItem>, CoreError> {
+    pub fn outbox_for_retry(&mut self) -> Result<Vec<OutboxItem>, CoreError> {
         if !matches!(
             self.state,
             AgentState::ActiveUnlockedLive | AgentState::OutboxFull
         ) {
             return Ok(Vec::new());
         }
-        self.store.outbox_items()
+        let items = self.store.outbox_items();
+        self.fail_closed_on_store_error(items)
     }
 
     pub fn publish_accepted(&mut self, message_id: Uuid) -> Result<(), CoreError> {
@@ -693,8 +694,11 @@ impl AgentCore {
     }
 
     pub fn reconnect_delay_ms(attempt: u32, random_sample: u64) -> u64 {
-        let exponential = 500_u64.checked_shl(attempt.min(63)).unwrap_or(u64::MAX);
-        let ceiling = exponential.min(30_000);
+        let ceiling = if attempt >= 6 {
+            30_000
+        } else {
+            500_u64 << attempt
+        };
         random_sample % (ceiling + 1)
     }
 

@@ -500,7 +500,13 @@ fn marker_is_cleared_on_restart_and_backoff_uses_full_jitter() {
     backoff.entered_live(NOW);
     backoff.disconnected(NOW + 30_000);
     assert_eq!(backoff.attempt(), 0);
-    assert!(AgentCore::reconnect_delay_ms(63, u64::MAX) <= 30_000);
+    let capped_sample = u64::MAX % 30_001;
+    for attempt in [6, 61, 62, 63, u32::MAX] {
+        assert_eq!(
+            AgentCore::reconnect_delay_ms(attempt, u64::MAX),
+            capped_sample
+        );
+    }
 }
 
 #[test]
@@ -701,6 +707,24 @@ fn runtime_store_failure_enters_terminal_inactive_state() {
         .unwrap();
     assert_eq!(
         agent.commit_observation(token, NOW, &mut clipboard),
+        Err(CoreError::LocalStateUnavailable)
+    );
+    assert_eq!(agent.state(), AgentState::Stopping);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"later", "later"))
+        .is_none());
+}
+
+#[test]
+fn outbox_read_failure_enters_terminal_inactive_state() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    Connection::open(path)
+        .unwrap()
+        .execute("DROP TABLE outbox", [])
+        .unwrap();
+    assert_eq!(
+        agent.outbox_for_retry(),
         Err(CoreError::LocalStateUnavailable)
     );
     assert_eq!(agent.state(), AgentState::Stopping);
