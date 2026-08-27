@@ -21,9 +21,9 @@ umask 077
 mkdir -p "$output_directory"
 
 curl --fail --silent --show-error --unix-socket "$CLIPMESH_TEST_LOCALAPI_SOCKET" \
-  http://local-tailscaled/localapi/v0/status >"$output_directory/status.raw.json"
+  http://example.invalid/localapi/v0/status >"$output_directory/status.raw.json"
 curl --fail --silent --show-error --unix-socket "$CLIPMESH_TEST_LOCALAPI_SOCKET" \
-  "http://local-tailscaled/localapi/v0/whois?addr=$CLIPMESH_TEST_REMOTE_ADDR" \
+  "http://example.invalid/localapi/v0/whois?addr=$CLIPMESH_TEST_REMOTE_ADDR" \
   >"$output_directory/whois.raw.json"
 
 "$(dirname "$0")/sanitize-r3-localapi-fixture.sh" \

@@ -59,7 +59,23 @@ impl SystemLocalApi {
 
     fn self_addresses(&self) -> Result<Vec<IpAddr>, LocalApiError> {
         let value = self.request("/localapi/v0/status")?;
-        if value.as_object().map(|object| object.len()) != Some(1) {
+        let object = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
+        if !object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "TailscaleIPs"
+                    | "BackendState"
+                    | "Self"
+                    | "Peer"
+                    | "User"
+                    | "CurrentTailnet"
+                    | "Health"
+                    | "MagicDNSSuffix"
+                    | "CertDomains"
+                    | "Version"
+                    | "TUN"
+            )
+        }) {
             return Err(LocalApiError::MalformedResponse);
         }
         let addresses = value
@@ -80,13 +96,16 @@ impl SystemLocalApi {
 
     fn who_is(&self, remote: SocketAddr) -> Result<String, LocalApiError> {
         let value = self.request(&format!("/localapi/v0/whois?addr={remote}"))?;
-        if value.as_object().map(|object| object.len()) != Some(1) {
+        let object = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
+        if !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "Node" | "UserProfile" | "CapMap"))
+        {
             return Err(LocalApiError::MalformedResponse);
         }
         value
             .get("Node")
             .and_then(Value::as_object)
-            .filter(|node| node.len() == 1)
             .and_then(|node| node.get("StableID"))
             .and_then(Value::as_str)
             .filter(|stable_id| !stable_id.is_empty())
@@ -106,7 +125,7 @@ impl SystemLocalApi {
         stream
             .write_all(
                 format!(
-                    "GET {target} HTTP/1.1\\r\\nHost: local-tailscaled\\r\\nConnection: close\\r\\n\\r\\n"
+                    "GET {target} HTTP/1.1\\r\\nHost: example.invalid\\r\\nConnection: close\\r\\n\\r\\n"
                 )
                 .replace(r"\\r\\n", "\r\n")
                 .as_bytes(),
@@ -545,6 +564,27 @@ enum InboundFrame {
     Close,
 }
 
+#[derive(Debug)]
+enum FrameReadFailure {
+    Timeout,
+    Disconnected,
+    Protocol(EdgeError),
+}
+
+impl FrameReadFailure {
+    fn from_io(error: std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Self::Timeout,
+            std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected => Self::Disconnected,
+            _ => Self::Protocol(EdgeError::OutputFailed),
+        }
+    }
+}
+
 impl WebSocketConnection {
     fn from_upgraded(stream: TcpStream) -> Self {
         Self { stream }
@@ -583,13 +623,16 @@ impl WebSocketConnection {
         self.stream.flush()
     }
 
-    fn read_complete_frame(&mut self, maximum_bytes: usize) -> Result<InboundFrame, EdgeError> {
+    fn read_complete_frame(
+        &mut self,
+        maximum_bytes: usize,
+    ) -> Result<InboundFrame, FrameReadFailure> {
         let mut header = [0_u8; 2];
         self.stream
             .read_exact(&mut header)
-            .map_err(|_| EdgeError::OutputFailed)?;
+            .map_err(FrameReadFailure::from_io)?;
         if !matches!(header[0], 0x81 | 0x8a | 0x88) || header[1] & 0x80 == 0 {
-            return Err(EdgeError::ProtocolSchemaInvalid);
+            return Err(FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid));
         }
         let length = match header[1] & 0x7f {
             value @ 0..=125 => value as usize,
@@ -597,40 +640,40 @@ impl WebSocketConnection {
                 let mut bytes = [0_u8; 2];
                 self.stream
                     .read_exact(&mut bytes)
-                    .map_err(|_| EdgeError::OutputFailed)?;
+                    .map_err(FrameReadFailure::from_io)?;
                 u16::from_be_bytes(bytes) as usize
             }
             127 => {
                 let mut bytes = [0_u8; 8];
                 self.stream
                     .read_exact(&mut bytes)
-                    .map_err(|_| EdgeError::OutputFailed)?;
+                    .map_err(FrameReadFailure::from_io)?;
                 usize::try_from(u64::from_be_bytes(bytes))
-                    .map_err(|_| EdgeError::MessageTooLarge)?
+                    .map_err(|_| FrameReadFailure::Protocol(EdgeError::MessageTooLarge))?
             }
             _ => unreachable!("WebSocket length uses seven bits"),
         };
         if length > maximum_bytes {
-            return Err(EdgeError::MessageTooLarge);
+            return Err(FrameReadFailure::Protocol(EdgeError::MessageTooLarge));
         }
         let mut mask = [0_u8; 4];
         self.stream
             .read_exact(&mut mask)
-            .map_err(|_| EdgeError::OutputFailed)?;
+            .map_err(FrameReadFailure::from_io)?;
         let mut payload = vec![0_u8; length];
         self.stream
             .read_exact(&mut payload)
-            .map_err(|_| EdgeError::OutputFailed)?;
+            .map_err(FrameReadFailure::from_io)?;
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index % mask.len()];
         }
         match header[0] {
             0x81 => String::from_utf8(payload)
                 .map(InboundFrame::Text)
-                .map_err(|_| EdgeError::ProtocolSchemaInvalid),
+                .map_err(|_| FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid)),
             0x8a if payload.is_empty() => Ok(InboundFrame::Pong),
             0x88 => Ok(InboundFrame::Close),
-            _ => Err(EdgeError::ProtocolSchemaInvalid),
+            _ => Err(FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid)),
         }
     }
 }
@@ -958,7 +1001,14 @@ impl HubEdge {
     ) -> Result<(), EdgeFailure> {
         let InboundFrame::Text(text) = websocket
             .read_complete_frame(self.config.maximum_message_bytes())
-            .map_err(EdgeFailure)?
+            .map_err(|failure| {
+                EdgeFailure(match failure {
+                    FrameReadFailure::Protocol(error) => error,
+                    FrameReadFailure::Timeout | FrameReadFailure::Disconnected => {
+                        EdgeError::OutputFailed
+                    }
+                })
+            })?
         else {
             return Err(EdgeFailure(EdgeError::ProtocolSchemaInvalid));
         };
@@ -1344,8 +1394,14 @@ impl HubListener {
                     self.edge.close_session(session)?;
                     return Ok(());
                 }
-                Err(EdgeError::OutputFailed) => continue,
-                Err(error) => return self.close_with(session, &mut websocket, error, None),
+                Err(FrameReadFailure::Timeout) => continue,
+                Err(FrameReadFailure::Disconnected) => {
+                    self.edge.close_session(session)?;
+                    return Ok(());
+                }
+                Err(FrameReadFailure::Protocol(error)) => {
+                    return self.close_with(session, &mut websocket, error, None)
+                }
             }
         }
     }
@@ -1366,17 +1422,22 @@ impl HubListener {
 
 fn websocket_failure_frame(input: Option<&str>, error: EdgeError) -> String {
     let value = input.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let canonical_uuid = |candidate: Option<&str>| {
+        candidate
+            .and_then(|candidate| parse_uuid(candidate.to_owned()).ok())
+            .map(|parsed| parsed.to_string())
+    };
     match value.as_ref().and_then(|value| value.get("type")).and_then(Value::as_str) {
         Some("publish") => json!({
             "protocol_version": 1,
             "type": "publish_rejected",
-            "message_id": value.as_ref().and_then(|value| value.pointer("/event/message_id")).and_then(Value::as_str),
+            "message_id": canonical_uuid(value.as_ref().and_then(|value| value.pointer("/event/message_id")).and_then(Value::as_str)),
             "code": error.code(), "retryable": error.retryable()
         }).to_string(),
         Some("clear_history") => json!({
             "protocol_version": 1,
             "type": "clear_rejected",
-            "request_id": value.as_ref().and_then(|value| value.get("request_id")).and_then(Value::as_str),
+            "request_id": canonical_uuid(value.as_ref().and_then(|value| value.get("request_id")).and_then(Value::as_str)),
             "code": error.code(), "retryable": error.retryable()
         }).to_string(),
         _ => json!({"protocol_version": 1, "type": "error", "code": error.code(), "retryable": error.retryable()}).to_string(),
@@ -1769,6 +1830,7 @@ mod tests {
         available: bool,
         peer: Option<&'static str>,
         address: IpAddr,
+        documented_shape: bool,
         requests: Vec<String>,
     }
 
@@ -1782,6 +1844,7 @@ mod tests {
                 available: true,
                 peer: Some("peer-reserved-example"),
                 address: "100.64.0.7".parse().unwrap(),
+                documented_shape: false,
                 requests: Vec::new(),
             }));
             let server_state = Arc::clone(&state);
@@ -1799,9 +1862,24 @@ mod tests {
                             if !state.available {
                                 (503, "{}".to_owned())
                             } else if target.starts_with("/localapi/v0/status") {
-                                (200, format!(r#"{{"TailscaleIPs":["{}"]}}"#, state.address))
+                                let body = if state.documented_shape {
+                                    format!(
+                                        r#"{{"TailscaleIPs":["{}"],"BackendState":"Running","Version":"test"}}"#,
+                                        state.address
+                                    )
+                                } else {
+                                    format!(r#"{{"TailscaleIPs":["{}"]}}"#, state.address)
+                                };
+                                (200, body)
                             } else if let Some(peer) = state.peer {
-                                (200, format!(r#"{{"Node":{{"StableID":"{peer}"}}}}"#))
+                                let body = if state.documented_shape {
+                                    format!(
+                                        r#"{{"Node":{{"StableID":"{peer}","Name":"peer.example.invalid."}},"UserProfile":{{}},"CapMap":{{}}}}"#
+                                    )
+                                } else {
+                                    format!(r#"{{"Node":{{"StableID":"{peer}"}}}}"#)
+                                };
+                                (200, body)
                             } else {
                                 (404, "{}".to_owned())
                             }
@@ -1992,12 +2070,35 @@ mod tests {
     }
 
     #[test]
+    fn documented_multifield_localapi_success_shapes_are_admitted() {
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().documented_shape = true;
+        let local_api = daemon.client();
+        assert_eq!(
+            local_api.self_addresses().unwrap(),
+            vec!["100.64.0.7".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            local_api
+                .who_is("100.64.0.9:12345".parse().unwrap())
+                .unwrap(),
+            "peer-reserved-example"
+        );
+    }
+
+    #[test]
     fn websocket_failures_use_typed_v1_outcomes_and_exact_close_policy() {
         let publish = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"00000000-0000-4000-8000-000000000099"}}"#;
         let rejected = websocket_failure_frame(Some(publish), EdgeError::PublishRateLimited);
         assert!(rejected.contains(r#""type":"publish_rejected""#));
         assert!(rejected.contains(r#""code":"publish_rate_limited""#));
         assert!(!websocket_failure_closes(EdgeError::PublishRateLimited));
+        let secret =
+            r#"{"protocol_version":1,"type":"publish","event":{"message_id":"clipboard-secret"}}"#;
+        assert!(
+            websocket_failure_frame(Some(secret), EdgeError::ProtocolSchemaInvalid)
+                .contains(r#""message_id":null"#)
+        );
 
         let clear = r#"{"protocol_version":1,"type":"clear_history","request_id":"00000000-0000-4000-8000-000000000098"}"#;
         assert!(
@@ -2198,6 +2299,37 @@ mod tests {
             .unwrap()
             .contains("101 Switching Protocols"));
         client.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn owned_accept_loop_releases_the_session_on_tcp_eof() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let listener = HubEdge::bind_for_test(configured, daemon.client()).unwrap();
+        let server = thread::spawn(move || listener.accept_and_serve());
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"GET /v1/stream HTTP/1.1\r\nHost: simulator\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: clipmesh.v1\r\n\r\n").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut response = Vec::new();
+        while !response
+            .windows(b"server_hello".len())
+            .any(|window| window == b"server_hello")
+        {
+            let mut chunk = [0_u8; 1024];
+            let size = client.read(&mut chunk).unwrap();
+            response.extend_from_slice(&chunk[..size]);
+        }
+        drop(client);
         assert!(server.join().unwrap().is_ok());
     }
 

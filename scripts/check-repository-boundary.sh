@@ -60,7 +60,7 @@ normalize_url_host() {
 
 is_reserved_network_host() {
   case "$1" in
-    github.com|example.invalid|*.example.invalid) return 0 ;;
+    github.com|example.invalid|*.example.invalid|local-tailscaled) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -104,7 +104,7 @@ require_reserved_network_hosts() {
 }
 
 require_reserved_network_hosts
-require_clean_match_free '([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9.-]|$)' 'private service hostname' case_insensitive
+require_clean_match_free '([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9._-]|$)' 'private service hostname' case_insensitive
 
 # The exact denylist stays owner-only. A hit identifies only its line and the
 # public path or commit that needs repair; it never writes the private literal.
