@@ -326,8 +326,9 @@ impl AgentCore {
         {
             return Err(CoreError::InvalidEvent);
         }
-        let snapshot = self.store.snapshot()?;
-        match snapshot.clear_generation {
+        let snapshot = self.store.snapshot();
+        let snapshot = self.fail_closed_on_store_error(snapshot)?;
+        let context_result = match snapshot.clear_generation {
             Some(generation) if parameters.clear_generation < generation => {
                 return Err(CoreError::ClearGenerationStale);
             }
@@ -336,15 +337,16 @@ impl AgentCore {
                     &parameters.history_epoch,
                     parameters.clear_generation,
                     None,
-                )?
+                )
             }
             Some(_) if snapshot.history_epoch != Some(parameters.history_epoch) => self
                 .store
-                .apply_epoch_change(&parameters.history_epoch, parameters.clear_generation)?,
+                .apply_epoch_change(&parameters.history_epoch, parameters.clear_generation),
             _ => self
                 .store
-                .establish_context(&parameters.history_epoch, parameters.clear_generation)?,
-        }
+                .establish_context(&parameters.history_epoch, parameters.clear_generation),
+        };
+        self.fail_closed_on_store_error(context_result)?;
         self.session = Some(parameters);
         self.last_ack_sent_at_ms = None;
         Ok(())
@@ -370,6 +372,9 @@ impl AgentCore {
     }
 
     pub fn set_locked(&mut self, locked: bool) {
+        if self.failure_is_terminal() {
+            return;
+        }
         if locked {
             self.session = None;
             self.pending_ack = None;
@@ -436,7 +441,7 @@ impl AgentCore {
             ));
         }
 
-        let session = self.session.as_ref().ok_or(CoreError::InvalidTransition)?;
+        let session = self.session.clone().ok_or(CoreError::InvalidTransition)?;
         let content =
             match ClipContentV1::from_platform(&token.observation.bytes, session.max_payload_bytes)
                 .map_err(map_content_error)
@@ -454,7 +459,9 @@ impl AgentCore {
                 Err(error) => return Err(error),
             };
 
-        if let Some(marker) = self.store.snapshot()?.loop_marker {
+        let snapshot = self.store.snapshot();
+        let snapshot = self.fail_closed_on_store_error(snapshot)?;
+        if let Some(marker) = snapshot.loop_marker {
             if token.observation.revision == marker.revision {
                 if content.same_content(&marker.content) {
                     return Ok(ObservationResult::Suppressed(
@@ -464,16 +471,19 @@ impl AgentCore {
                 self.adapter_failed();
                 return Err(CoreError::AdapterUnavailable);
             }
-            self.store.clear_loop_marker()?;
+            let cleared = self.store.clear_loop_marker();
+            self.fail_closed_on_store_error(cleared)?;
         }
 
         let created_at_ms = local_utc_ms.saturating_add(session.server_time_offset_ms);
-        self.store.remove_stale_outbox(
+        let stale_removed = self.store.remove_stale_outbox(
             created_at_ms,
             session.retention_seconds,
             session.clear_generation,
-        )?;
-        let (count, bytes) = self.store.outbox_usage()?;
+        );
+        self.fail_closed_on_store_error(stale_removed)?;
+        let usage = self.store.outbox_usage();
+        let (count, bytes) = self.fail_closed_on_store_error(usage)?;
         if count >= OUTBOX_MAX_EVENTS
             || bytes.saturating_add(content.as_storage_blob().len()) > OUTBOX_MAX_BYTES
         {
@@ -489,7 +499,8 @@ impl AgentCore {
             created_at_ms,
             content,
         };
-        self.store.insert_outbox(&event)?;
+        let inserted = self.store.insert_outbox(&event);
+        self.fail_closed_on_store_error(inserted)?;
         Ok(ObservationResult::Queued(OutboxItem { event }))
     }
 
@@ -504,7 +515,8 @@ impl AgentCore {
     }
 
     pub fn publish_accepted(&mut self, message_id: Uuid) -> Result<(), CoreError> {
-        self.store.remove_outbox(message_id)?;
+        let removed = self.store.remove_outbox(message_id);
+        self.fail_closed_on_store_error(removed)?;
         self.leave_outbox_full_if_possible()
     }
 
@@ -515,8 +527,10 @@ impl AgentCore {
         retryable: bool,
     ) -> Result<(), CoreError> {
         if !retryable {
-            self.store
-                .record_publish_failure(message_id, failure.code())?;
+            let recorded = self
+                .store
+                .record_publish_failure(message_id, failure.code());
+            self.fail_closed_on_store_error(recorded)?;
             self.leave_outbox_full_if_possible()?;
         }
         Ok(())
@@ -528,7 +542,7 @@ impl AgentCore {
         local_utc_ms: i64,
         adapter: &mut A,
     ) -> Result<ReceiveResult, CoreError> {
-        let session = self.session.as_ref().ok_or(CoreError::InvalidTransition)?;
+        let session = self.session.clone().ok_or(CoreError::InvalidTransition)?;
         if received.history_epoch != session.history_epoch {
             return Err(CoreError::SessionEpochStale);
         }
@@ -551,7 +565,8 @@ impl AgentCore {
         if !valid_state {
             return Err(CoreError::InvalidTransition);
         }
-        let snapshot = self.store.snapshot()?;
+        let snapshot = self.store.snapshot();
+        let snapshot = self.fail_closed_on_store_error(snapshot)?;
         if snapshot
             .last_cursor
             .is_some_and(|cursor| received.cursor <= cursor)
@@ -573,13 +588,17 @@ impl AgentCore {
             session.max_payload_bytes,
         )
         .map_err(map_content_error)?;
-        let already_processed = self.store.has_processed(received.message_id)?;
+        let processed = self.store.has_processed(received.message_id);
+        let already_processed = self.fail_closed_on_store_error(processed)?;
         let apply = !already_processed
             && received.delivery == Delivery::Live
             && received.source_peer_id != session.self_peer_id
             && self.state == AgentState::ActiveUnlockedLive;
 
-        let marker = if apply {
+        let recorded = self.store.record_received(&received, &content);
+        self.fail_closed_on_store_error(recorded)?;
+
+        if apply {
             let revision = match adapter.write_text(content.to_platform()) {
                 Ok(revision) => revision,
                 Err(_) => {
@@ -587,23 +606,13 @@ impl AgentCore {
                     return Err(CoreError::AdapterUnavailable);
                 }
             };
-            Some(LoopMarker {
+            let marker = LoopMarker {
                 message_id: received.message_id,
                 content: content.clone(),
                 revision,
-            })
-        } else {
-            None
-        };
-        if let Err(error) = self
-            .store
-            .record_received(&received, &content, marker.as_ref())
-        {
-            // A successful platform write cannot be rolled back. Stop every
-            // observable seam before returning the storage failure so no
-            // watcher echo or same-session redelivery can follow it.
-            self.stop();
-            return Err(error);
+            };
+            let marker_recorded = self.store.replace_loop_marker(&marker);
+            self.fail_closed_on_store_error(marker_recorded)?;
         }
         self.pending_ack = Some(AckCursor {
             history_epoch: received.history_epoch,
@@ -627,19 +636,20 @@ impl AgentCore {
         clear_generation: u64,
         cleared_through_cursor: Option<u64>,
     ) -> Result<(), CoreError> {
+        let snapshot = self.store.snapshot();
         let current = self
-            .store
-            .snapshot()?
+            .fail_closed_on_store_error(snapshot)?
             .clear_generation
             .ok_or(CoreError::InvalidTransition)?;
         if clear_generation <= current {
             return Err(CoreError::ClearGenerationStale);
         }
-        self.store.apply_generation_change(
+        let changed = self.store.apply_generation_change(
             &history_epoch,
             clear_generation,
             cleared_through_cursor,
-        )?;
+        );
+        self.fail_closed_on_store_error(changed)?;
         if let Some(session) = self.session.as_mut() {
             session.history_epoch = history_epoch;
             session.clear_generation = clear_generation;
@@ -650,6 +660,9 @@ impl AgentCore {
     }
 
     pub fn local_control(&mut self, control: LocalControl) -> Result<Status, CoreError> {
+        if self.failure_is_terminal() && control != LocalControl::Status {
+            return Err(CoreError::InvalidTransition);
+        }
         match control {
             LocalControl::Status => {}
             LocalControl::Pause => {
@@ -662,7 +675,10 @@ impl AgentCore {
                     self.transition(AgentState::ActiveUnlockedConnecting);
                 }
             }
-            LocalControl::ClearLocalHistory => self.store.clear_local_history()?,
+            LocalControl::ClearLocalHistory => {
+                let cleared = self.store.clear_local_history();
+                self.fail_closed_on_store_error(cleared)?;
+            }
             LocalControl::LocalOnlyNext => self.local_only_next = true,
         }
         self.status()
@@ -687,8 +703,23 @@ impl AgentCore {
         self.state_generation = self.state_generation.wrapping_add(1);
     }
 
+    fn failure_is_terminal(&self) -> bool {
+        matches!(self.state, AgentState::AdapterFailed | AgentState::Stopping)
+    }
+
+    fn fail_closed_on_store_error<T>(
+        &mut self,
+        result: Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        if matches!(result, Err(CoreError::LocalStateUnavailable)) {
+            self.stop();
+        }
+        result
+    }
+
     fn leave_outbox_full_if_possible(&mut self) -> Result<(), CoreError> {
-        let (count, bytes) = self.store.outbox_usage()?;
+        let usage = self.store.outbox_usage();
+        let (count, bytes) = self.fail_closed_on_store_error(usage)?;
         if self.state == AgentState::OutboxFull
             && count < OUTBOX_MAX_EVENTS
             && bytes < OUTBOX_MAX_BYTES

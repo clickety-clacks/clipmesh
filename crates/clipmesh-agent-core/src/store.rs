@@ -332,7 +332,6 @@ impl StateStore {
         &mut self,
         received: &ReceivedEvent,
         content: &ClipContentV1,
-        marker: Option<&LoopMarker>,
     ) -> Result<(), CoreError> {
         let transaction = self.transaction()?;
         set_metadata(
@@ -377,23 +376,26 @@ impl StateStore {
                 [],
             )
             .map_err(|_| CoreError::LocalStateUnavailable)?;
-        if let Some(marker) = marker {
-            transaction
-                .execute(
-                    "INSERT INTO loop_marker(singleton, message_id, revision, content)
-                     VALUES (1, ?1, ?2, ?3)
-                     ON CONFLICT(singleton) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     revision = excluded.revision,
-                     content = excluded.content",
-                    params![
-                        marker.message_id.to_string(),
-                        marker.revision.storage_value(),
-                        marker.content.as_storage_blob(),
-                    ],
-                )
-                .map_err(|_| CoreError::LocalStateUnavailable)?;
-        }
+        commit(transaction)
+    }
+
+    pub(crate) fn replace_loop_marker(&mut self, marker: &LoopMarker) -> Result<(), CoreError> {
+        let transaction = self.transaction()?;
+        transaction
+            .execute(
+                "INSERT INTO loop_marker(singleton, message_id, revision, content)
+                 VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                 message_id = excluded.message_id,
+                 revision = excluded.revision,
+                 content = excluded.content",
+                params![
+                    marker.message_id.to_string(),
+                    marker.revision.storage_value(),
+                    marker.content.as_storage_blob(),
+                ],
+            )
+            .map_err(|_| CoreError::LocalStateUnavailable)?;
         commit(transaction)
     }
 
@@ -504,7 +506,7 @@ fn validate_regular_owner_file(path: &Path) -> Result<(), CoreError> {
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(CoreError::StatePathInsecure);
     }
-    validate_owner_mode(&metadata, 0o077)
+    validate_owner_mode(&metadata, 0o177)
 }
 
 fn validate_owner_mode(metadata: &fs::Metadata, forbidden: u32) -> Result<(), CoreError> {

@@ -23,7 +23,7 @@ struct SyntheticClipboard {
     next_write: u64,
     fail_current: bool,
     fail_write: bool,
-    drop_history_after_write: Option<PathBuf>,
+    drop_loop_marker_after_write: Option<PathBuf>,
 }
 
 impl SyntheticClipboard {
@@ -54,10 +54,10 @@ impl ClipboardAdapter for SyntheticClipboard {
         let revision = PlatformRevision::synthetic(format!("remote-{}", self.next_write));
         self.current_revision = Some(revision.clone());
         self.writes.push(bytes.to_vec());
-        if let Some(path) = self.drop_history_after_write.take() {
+        if let Some(path) = self.drop_loop_marker_after_write.take() {
             Connection::open(path)
                 .unwrap()
-                .execute("DROP TABLE history", [])
+                .execute("DROP TABLE loop_marker", [])
                 .unwrap();
         }
         Ok(revision)
@@ -438,6 +438,19 @@ fn state_path_failures_are_distinct_and_unsupported_schema_is_byte_identical() {
         );
         assert_eq!(std::fs::read(&broad_file).unwrap(), broad_file_before);
 
+        let executable_file = directory.path().join("executable-file.sqlite3");
+        drop(AgentCore::open(&executable_file).unwrap());
+        std::fs::set_permissions(&executable_file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable_file_before = std::fs::read(&executable_file).unwrap();
+        assert_eq!(
+            AgentCore::open(&executable_file).err().unwrap(),
+            CoreError::StatePathInsecure
+        );
+        assert_eq!(
+            std::fs::read(&executable_file).unwrap(),
+            executable_file_before
+        );
+
         let read_only = directory.path().join("read-only.sqlite3");
         drop(AgentCore::open(&read_only).unwrap());
         std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o400)).unwrap();
@@ -577,6 +590,18 @@ fn adapter_errors_make_the_agent_inactive_until_external_repair() {
     assert!(agent
         .begin_observation(clipboard.observe(b"later", "later"))
         .is_none());
+    agent.set_locked(true);
+    agent.set_locked(false);
+    assert_eq!(agent.state(), AgentState::AdapterFailed);
+    assert_eq!(
+        agent.local_control(LocalControl::Pause),
+        Err(CoreError::InvalidTransition)
+    );
+    assert_eq!(
+        agent.local_control(LocalControl::Resume),
+        Err(CoreError::InvalidTransition)
+    );
+    assert_eq!(agent.state(), AgentState::AdapterFailed);
 
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);
@@ -590,16 +615,20 @@ fn adapter_errors_make_the_agent_inactive_until_external_repair() {
         Err(CoreError::AdapterUnavailable)
     );
     assert_eq!(agent.state(), AgentState::AdapterFailed);
+    let snapshot = agent.snapshot().unwrap();
+    assert_eq!(snapshot.last_cursor, Some(1));
+    assert_eq!(snapshot.history_count, 1);
+    assert_eq!(snapshot.processed_message_count, 1);
     assert!(agent
         .begin_observation(clipboard.observe(b"later", "later"))
         .is_none());
 }
 
 #[test]
-fn post_write_storage_failure_stops_every_observable_seam() {
+fn durable_delivery_precedes_platform_write_and_marker_failure_stops_observation() {
     let (_directory, path) = state_path();
     let (mut agent, mut clipboard) = live_agent(&path);
-    clipboard.drop_history_after_write = Some(path);
+    clipboard.drop_loop_marker_after_write = Some(path.clone());
     assert_eq!(
         agent.receive_event(
             received(1, Delivery::Live, REMOTE_PEER, b"remote"),
@@ -614,6 +643,70 @@ fn post_write_storage_failure_stops_every_observable_seam() {
         .begin_observation(clipboard.observe(b"remote", "remote-1"))
         .is_none());
     assert!(agent.outbox_for_retry().unwrap().is_empty());
+
+    let connection = Connection::open(path).unwrap();
+    let history_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+        .unwrap();
+    let processed_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM processed_message", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let cursor: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'last_cursor'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (history_count, processed_count, cursor.as_str()),
+        (1, 1, "1")
+    );
+}
+
+#[test]
+fn pre_write_storage_failure_writes_nothing_and_stops_observation() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    Connection::open(&path)
+        .unwrap()
+        .execute("DROP TABLE history", [])
+        .unwrap();
+    assert_eq!(
+        agent.receive_event(
+            received(1, Delivery::Live, REMOTE_PEER, b"remote"),
+            NOW,
+            &mut clipboard,
+        ),
+        Err(CoreError::LocalStateUnavailable)
+    );
+    assert!(clipboard.writes.is_empty());
+    assert_eq!(agent.state(), AgentState::Stopping);
+    agent.set_locked(true);
+    agent.set_locked(false);
+    assert_eq!(agent.state(), AgentState::Stopping);
+}
+
+#[test]
+fn runtime_store_failure_enters_terminal_inactive_state() {
+    let (_directory, path) = state_path();
+    let (mut agent, mut clipboard) = live_agent(&path);
+    let observation = clipboard.observe(b"local", "local-store-error");
+    let token = agent.begin_observation(observation).unwrap();
+    Connection::open(path)
+        .unwrap()
+        .execute("DROP TABLE loop_marker", [])
+        .unwrap();
+    assert_eq!(
+        agent.commit_observation(token, NOW, &mut clipboard),
+        Err(CoreError::LocalStateUnavailable)
+    );
+    assert_eq!(agent.state(), AgentState::Stopping);
+    assert!(agent
+        .begin_observation(clipboard.observe(b"later", "later"))
+        .is_none());
 }
 
 #[test]
