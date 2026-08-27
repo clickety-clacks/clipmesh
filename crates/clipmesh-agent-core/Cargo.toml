@@ -1,0 +1,18 @@
+[package]
+name = "clipmesh-agent-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clipmesh-hub-core = { path = "../clipmesh-hub-core" }
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+base64 = "0.22"
+sha2 = "0.10"
+tempfile = "3"

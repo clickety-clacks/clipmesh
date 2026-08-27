@@ -17,12 +17,15 @@ its canonical reviewed specification reference.
 ## Status
 
 The immutable Rust protocol foundation, the remediated transport-neutral hub
-policy core, and a dormant Tailnet edge are present. The edge validates a
+policy core, the persistent desktop domain core, and a dormant Tailnet edge are
+present. The desktop core provides outbox, resume, clear-generation,
+local-control, revision-marker, and synthetic adapter seams without opening a
+network or platform listener. The edge validates a
 configured Tailnet self address through LocalAPI, resolves each accepted
 socket with WhoIs before HTTP parsing, and holds the hub event lease through
 complete WebSocket-frame output. It has no executable or default listener.
 The hub core provides SQLite-only ordering, retry, resume, acknowledgement,
 retention, shared clear, and canonical clip-content custody.
 
-Desktop, mobile, packaging, deployment, listener activation, and private
-topology remain outside this repository slice.
+Platform adapters, mobile, packaging, deployment, listener activation, and
+private topology remain outside this repository slice.

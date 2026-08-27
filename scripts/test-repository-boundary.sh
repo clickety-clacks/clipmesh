@@ -92,6 +92,11 @@ printf '%s://hub.%s.example.invalid\n' "$(printf '%s%s' ht tps)" "$(printf '%s' 
 git -C "$reserved_target" add seed.txt
 "$reserved_target/scripts/check-repository-boundary.sh"
 
+identifier_target=$(make_repo identifier)
+printf '%s\n' 'self.local_only_next' > "$identifier_target/seed.txt"
+git -C "$identifier_target" add seed.txt
+"$identifier_target/scripts/check-repository-boundary.sh"
+
 denylist_target=$(make_repo denylist)
 denylist_literal="owner-only-$(printf '%s' marker)"
 printf '%s\n' "$denylist_literal" > "$denylist_target/seed.txt"

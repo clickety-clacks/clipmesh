@@ -104,7 +104,7 @@ require_reserved_network_hosts() {
 }
 
 require_reserved_network_hosts
-require_clean_match_free '([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9._-]|$)' 'private service hostname' case_insensitive
+require_clean_match_free '(^|[^A-Za-z0-9_.-])([A-Za-z0-9-]+\.)+(internal|local|lan|home|corp)([^A-Za-z0-9_.-]|$)' 'private service hostname' case_insensitive
 
 # The exact denylist stays owner-only. A hit identifies only its line and the
 # public path or commit that needs repair; it never writes the private literal.
