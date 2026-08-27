@@ -1,18 +1,18 @@
 //! Tailnet-only HTTP and WebSocket edge for the transport-neutral hub core.
 //!
 //! This crate deliberately has no executable and never starts a listener by
-//! itself. A deployment-owned process may bind the validated address and pass
-//! each accepted socket's observed remote address to [`HubEdge::admit_socket`]
-//! before it reads one HTTP byte.
+//! itself. A deployment-owned process may explicitly create the dormant
+//! listener through [`HubEdge::bind`]. That listener owns both accepted socket
+//! addresses and obtains WhoIs before it reads one HTTP byte.
 
 use std::{
     collections::HashMap,
     io::{Read, Write},
-    net::{IpAddr, SocketAddr, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -145,6 +145,7 @@ impl LocalApiError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeConfig {
     pub listen_address: SocketAddr,
+    pub state_directory: PathBuf,
     pub retention_seconds: u64,
     pub history_max_entries: usize,
     pub max_payload_bytes: usize,
@@ -230,6 +231,7 @@ impl EdgeConfig {
             .map_err(|_| EdgeError::ConfigValueInvalid)?;
         let config = Self {
             listen_address,
+            state_directory: PathBuf::from(raw.state_directory),
             retention_seconds: raw.retention_seconds,
             history_max_entries: raw.history_max_entries,
             max_payload_bytes: raw.max_payload_bytes,
@@ -246,6 +248,7 @@ impl EdgeConfig {
 
     fn validate(&self) -> Result<(), EdgeError> {
         if self.listen_address.port() == 0
+            || self.state_directory.as_os_str().is_empty()
             || !(60..=31_536_000).contains(&self.retention_seconds)
             || !(1..=10_000).contains(&self.history_max_entries)
             || !(1..=1_048_576).contains(&self.max_payload_bytes)
@@ -276,11 +279,13 @@ pub enum EdgeError {
     TailnetPeerUnverified,
     ConnectionLimitReached,
     RequestRateLimited,
+    PublishRateLimited,
     MessageTooLarge,
     MessageRateLimited,
     SlowConsumer,
     ResumeDeadlineExceeded,
     HeartbeatTimedOut,
+    BindFailed,
     ProtocolVersionUnsupported,
     ProtocolSchemaInvalid,
     ResumeRequired,
@@ -320,11 +325,13 @@ impl EdgeError {
             Self::TailnetPeerUnverified => "tailnet_peer_unverified",
             Self::ConnectionLimitReached => "connection_limit_reached",
             Self::RequestRateLimited => "request_rate_limited",
+            Self::PublishRateLimited => "publish_rate_limited",
             Self::MessageTooLarge => "message_too_large",
             Self::MessageRateLimited => "message_rate_limited",
             Self::SlowConsumer => "slow_consumer",
             Self::ResumeDeadlineExceeded => "resume_deadline_exceeded",
-            Self::HeartbeatTimedOut => "heartbeat_timed_out",
+            Self::HeartbeatTimedOut => "heartbeat_timeout",
+            Self::BindFailed => "bind_failed",
             Self::ProtocolVersionUnsupported => "protocol_version_unsupported",
             Self::ProtocolSchemaInvalid => "protocol_schema_invalid",
             Self::ResumeRequired => "resume_required",
@@ -362,7 +369,9 @@ impl EdgeError {
                 | Self::TailnetPeerUnverified
                 | Self::ConnectionLimitReached
                 | Self::RequestRateLimited
+                | Self::PublishRateLimited
                 | Self::MessageRateLimited
+                | Self::SlowConsumer
                 | Self::SessionContextStale
                 | Self::ClearGenerationAhead
                 | Self::CreatedAtInFuture
@@ -434,8 +443,7 @@ pub enum UpgradeResult {
     Upgraded(SessionHandle),
 }
 
-/// A completed decision for one already-accepted socket. This edge never
-/// binds or activates a listener.
+/// A completed decision for one edge-owned accepted socket.
 pub enum ServedConnection {
     Rejected(HttpResponse),
     Upgraded {
@@ -456,7 +464,7 @@ struct EdgeSession {
     last_pong_ms: i64,
     awaiting_resume: bool,
     message_window_started_ms: i64,
-    message_count: u32,
+    message_tokens: u32,
     publish_window_started_ms: i64,
     publish_tokens: u32,
 }
@@ -464,6 +472,36 @@ struct EdgeSession {
 #[derive(Default)]
 struct Runtime {
     not_ready: Option<EdgeError>,
+    connection_attempts: HashMap<StablePeerId, RateBucket>,
+    http_requests: HashMap<StablePeerId, RateBucket>,
+}
+
+struct RateBucket {
+    tokens: u32,
+    updated_at_ms: i64,
+}
+
+impl RateBucket {
+    fn take(&mut self, now_ms: i64, per_minute: u32, burst: u32) -> bool {
+        let elapsed_ms = now_ms.saturating_sub(self.updated_at_ms);
+        let refill = (elapsed_ms.saturating_mul(i64::from(per_minute)) / 60_000) as u32;
+        if refill > 0 {
+            self.updated_at_ms = now_ms;
+            self.tokens = self.tokens.saturating_add(refill).min(burst);
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// Owns the one configured application listener. It is inert until a caller
+/// explicitly invokes [`HubEdge::bind`]; no executable activates it by default.
+pub struct HubListener {
+    edge: HubEdge,
+    listener: TcpListener,
 }
 
 /// Concrete WebSocket owner. It writes a complete server text frame before a
@@ -471,6 +509,12 @@ struct Runtime {
 /// the generation seam releases it.
 pub struct WebSocketConnection {
     stream: TcpStream,
+}
+
+enum InboundFrame {
+    Text(String),
+    Pong,
+    Close,
 }
 
 impl WebSocketConnection {
@@ -498,12 +542,25 @@ impl WebSocketConnection {
         self.stream.flush()
     }
 
-    fn read_complete_text(&mut self, maximum_bytes: usize) -> Result<String, EdgeError> {
+    fn write_ping(&mut self) -> std::io::Result<()> {
+        self.stream.write_all(&[0x89, 0])?;
+        self.stream.flush()
+    }
+
+    fn write_close(&mut self, error: EdgeError) -> std::io::Result<()> {
+        let mut payload = error.websocket_close_code().to_be_bytes().to_vec();
+        payload.extend_from_slice(error.code().as_bytes());
+        self.stream.write_all(&[0x88, payload.len() as u8])?;
+        self.stream.write_all(&payload)?;
+        self.stream.flush()
+    }
+
+    fn read_complete_frame(&mut self, maximum_bytes: usize) -> Result<InboundFrame, EdgeError> {
         let mut header = [0_u8; 2];
         self.stream
             .read_exact(&mut header)
             .map_err(|_| EdgeError::OutputFailed)?;
-        if header[0] != 0x81 || header[1] & 0x80 == 0 {
+        if !matches!(header[0], 0x81 | 0x8a | 0x88) || header[1] & 0x80 == 0 {
             return Err(EdgeError::ProtocolSchemaInvalid);
         }
         let length = match header[1] & 0x7f {
@@ -539,7 +596,14 @@ impl WebSocketConnection {
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index % mask.len()];
         }
-        String::from_utf8(payload).map_err(|_| EdgeError::ProtocolSchemaInvalid)
+        match header[0] {
+            0x81 => String::from_utf8(payload)
+                .map(InboundFrame::Text)
+                .map_err(|_| EdgeError::ProtocolSchemaInvalid),
+            0x8a if payload.is_empty() => Ok(InboundFrame::Pong),
+            0x88 => Ok(InboundFrame::Close),
+            _ => Err(EdgeError::ProtocolSchemaInvalid),
+        }
     }
 }
 
@@ -554,7 +618,7 @@ pub struct HubEdge {
 impl HubEdge {
     /// Validates config and current LocalAPI status before opening hub state.
     /// It does not bind or activate a listener.
-    pub fn prepare(
+    fn prepare(
         config: EdgeConfig,
         local_api: SystemLocalApi,
         database: impl AsRef<Path>,
@@ -586,12 +650,29 @@ impl HubEdge {
         })
     }
 
+    /// Binds only the LocalAPI-verified configured address and derives both
+    /// socket identities internally on every accept.
+    pub fn bind(config: EdgeConfig, local_api: SystemLocalApi) -> Result<HubListener, EdgeFailure> {
+        let database = config.state_directory.join("hub.sqlite");
+        let edge = Self::prepare(config, local_api, database)?;
+        let listener = TcpListener::bind(edge.config.listen_address)
+            .map_err(|_| EdgeFailure(EdgeError::BindFailed))?;
+        if listener
+            .local_addr()
+            .map_err(|_| EdgeFailure(EdgeError::BindFailed))?
+            != edge.config.listen_address
+        {
+            return Err(EdgeFailure(EdgeError::BindFailed));
+        }
+        Ok(HubListener { edge, listener })
+    }
+
     pub fn config(&self) -> &EdgeConfig {
         &self.config
     }
 
-    /// Calls WhoIs before any HTTP parser is invoked by the caller.
-    pub fn admit_socket(&self, observed_remote: SocketAddr) -> Result<AdmittedSocket, EdgeFailure> {
+    /// Calls WhoIs on the peer address observed from an accepted socket.
+    fn admit_socket(&self, observed_remote: SocketAddr) -> Result<AdmittedSocket, EdgeFailure> {
         let stable_id = self
             .local_api
             .who_is(observed_remote)
@@ -602,7 +683,7 @@ impl HubEdge {
     }
 
     /// Validates an admitted HTTP request in the specified precedence order.
-    pub fn upgrade(&self, admitted: AdmittedSocket, request: &HttpRequest) -> UpgradeResult {
+    fn upgrade(&self, admitted: AdmittedSocket, request: &HttpRequest) -> UpgradeResult {
         if let Some(response) = validate_http(request) {
             return UpgradeResult::Response(response);
         }
@@ -630,7 +711,7 @@ impl HubEdge {
                 last_pong_ms: 0,
                 awaiting_resume: true,
                 message_window_started_ms: 0,
-                message_count: 0,
+                message_tokens: 20,
                 publish_window_started_ms: 0,
                 publish_tokens: self.config.publish_burst,
             },
@@ -643,15 +724,46 @@ impl HubEdge {
     /// Runs the production WhoIs, HTTP, and WebSocket handshake path for an
     /// already-accepted socket. It calls WhoIs before consuming HTTP bytes and
     /// emits `server_hello` as the first WebSocket text frame.
-    pub fn serve_accepted(
+    fn serve_accepted(
         &self,
         mut stream: TcpStream,
-        observed_remote: SocketAddr,
         now_ms: i64,
     ) -> Result<ServedConnection, EdgeFailure> {
+        if stream
+            .local_addr()
+            .map_err(|_| EdgeFailure(EdgeError::TailnetBindUnverified))?
+            != self.config.listen_address
+        {
+            return Err(EdgeFailure(EdgeError::TailnetBindUnverified));
+        }
+        self.require_ready()?;
+        let observed_remote = stream
+            .peer_addr()
+            .map_err(|_| EdgeFailure(EdgeError::TailnetPeerUnverified))?;
         let admitted = self.admit_socket(observed_remote)?;
+        if !self.consume_connection_attempt(&admitted.peer_id, now_ms) {
+            return Err(EdgeFailure(EdgeError::RequestRateLimited));
+        }
         let request = read_http_request(&mut stream)
             .map_err(|_| EdgeFailure(EdgeError::ProtocolSchemaInvalid))?;
+        if !self.consume_http_request(&admitted.peer_id, now_ms) {
+            let response = HttpResponse::error(429, EdgeError::RequestRateLimited);
+            write_http_response(&mut stream, &response)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+            return Ok(ServedConnection::Rejected(response));
+        }
+        if request.method == "GET" && request.target == "/healthz" {
+            let response = self.health();
+            write_http_response(&mut stream, &response)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+            return Ok(ServedConnection::Rejected(response));
+        }
+        if request.method == "GET" && request.target == "/readyz" {
+            let response = self.readiness();
+            write_http_response(&mut stream, &response)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+            return Ok(ServedConnection::Rejected(response));
+        }
         if let Some(response) = validate_http(&request) {
             write_http_response(&mut stream, &response)
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
@@ -742,7 +854,7 @@ impl HubEdge {
                 .ok_or(EdgeFailure(EdgeError::SessionContextStale))?
                 .awaiting_resume = false;
         }
-        self.enforce_queue_limits()?;
+        self.close_slow_consumers()?;
         Ok(())
     }
 
@@ -783,9 +895,12 @@ impl HubEdge {
         websocket: &mut WebSocketConnection,
         now_ms: i64,
     ) -> Result<(), EdgeFailure> {
-        let text = websocket
-            .read_complete_text(self.config.maximum_message_bytes())
-            .map_err(EdgeFailure)?;
+        let InboundFrame::Text(text) = websocket
+            .read_complete_frame(self.config.maximum_message_bytes())
+            .map_err(EdgeFailure)?
+        else {
+            return Err(EdgeFailure(EdgeError::ProtocolSchemaInvalid));
+        };
         self.handle_text(session, &text, now_ms)
     }
 
@@ -814,9 +929,6 @@ impl HubEdge {
                 && now_ms.saturating_sub(entry.opened_at_ms) > 5_000
             {
                 Some(EdgeError::ResumeDeadlineExceeded)
-            } else if entry.opened_at_ms != 0 && now_ms.saturating_sub(entry.last_pong_ms) > 45_000
-            {
-                Some(EdgeError::HeartbeatTimedOut)
             } else {
                 None
             }
@@ -904,14 +1016,19 @@ impl HubEdge {
             .entries
             .get_mut(&session_id)
             .ok_or(EdgeFailure(EdgeError::SessionContextStale))?;
-        if now_ms.saturating_sub(session.message_window_started_ms) >= 60_000 {
+        let elapsed_ms = now_ms.saturating_sub(session.message_window_started_ms);
+        let message_refill = (elapsed_ms.saturating_mul(120) / 60_000) as u32;
+        if message_refill > 0 {
             session.message_window_started_ms = now_ms;
-            session.message_count = 0;
+            session.message_tokens = session
+                .message_tokens
+                .saturating_add(message_refill)
+                .min(20);
         }
-        if session.message_count >= 20 {
+        if session.message_tokens == 0 {
             return Err(EdgeFailure(EdgeError::MessageRateLimited));
         }
-        session.message_count += 1;
+        session.message_tokens -= 1;
         if publish {
             let elapsed_ms = now_ms.saturating_sub(session.publish_window_started_ms);
             let refill = (elapsed_ms.saturating_mul(self.config.publish_tokens_per_minute as i64)
@@ -924,14 +1041,38 @@ impl HubEdge {
                     .min(self.config.publish_burst);
             }
             if session.publish_tokens == 0 {
-                return Err(EdgeFailure(EdgeError::RequestRateLimited));
+                return Err(EdgeFailure(EdgeError::PublishRateLimited));
             }
             session.publish_tokens -= 1;
         }
         Ok(())
     }
 
-    fn enforce_queue_limits(&self) -> Result<(), EdgeFailure> {
+    fn consume_connection_attempt(&self, peer_id: &StablePeerId, now_ms: i64) -> bool {
+        let mut runtime = self.runtime.lock().expect("edge runtime lock poisoned");
+        runtime
+            .connection_attempts
+            .entry(peer_id.clone())
+            .or_insert(RateBucket {
+                tokens: 10,
+                updated_at_ms: now_ms,
+            })
+            .take(now_ms, 30, 10)
+    }
+
+    fn consume_http_request(&self, peer_id: &StablePeerId, now_ms: i64) -> bool {
+        let mut runtime = self.runtime.lock().expect("edge runtime lock poisoned");
+        runtime
+            .http_requests
+            .entry(peer_id.clone())
+            .or_insert(RateBucket {
+                tokens: 20,
+                updated_at_ms: now_ms,
+            })
+            .take(now_ms, 120, 20)
+    }
+
+    fn close_slow_consumers(&self) -> Result<(), EdgeFailure> {
         let session_ids: Vec<_> = self
             .sessions
             .lock()
@@ -949,13 +1090,13 @@ impl HubEdge {
                     .then_some(id)
             })
             .collect();
-        if over_limit.is_empty() {
-            return Ok(());
-        }
         for id in over_limit {
             self.close_session(SessionHandle { id })?;
         }
-        Err(EdgeFailure(EdgeError::SlowConsumer))
+        // A recipient is closed after its queue crosses a bound. A completed
+        // publisher never receives that recipient's failure: its transaction
+        // and acknowledgement are already committed at the core seam.
+        Ok(())
     }
 
     fn handle_resume(&self, session_id: Uuid, text: &str, now_ms: i64) -> Result<(), EdgeFailure> {
@@ -1030,6 +1171,111 @@ impl HubEdge {
             .map(|_: ClearAccepted| ())
             .map_err(|error| EdgeFailure(core_error(error)))
     }
+}
+
+impl HubListener {
+    /// Accepts one socket from the listener this value owns. Neither the local
+    /// address nor the WhoIs input can be supplied by a caller.
+    pub fn accept_once(&self, now_ms: i64) -> Result<ServedConnection, EdgeFailure> {
+        let (stream, _) = self
+            .listener
+            .accept()
+            .map_err(|_| EdgeFailure(EdgeError::BindFailed))?;
+        self.edge.serve_accepted(stream, now_ms)
+    }
+
+    /// Owns the post-upgrade session lifecycle: output drain, ping interval,
+    /// LocalAPI probe, text admission, failure frame, and close frame.
+    pub fn accept_and_serve(&self) -> Result<(), EdgeFailure> {
+        let started = unix_ms()?;
+        let ServedConnection::Upgraded {
+            session,
+            mut websocket,
+        } = self.accept_once(started)?
+        else {
+            return Ok(());
+        };
+        websocket
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+        let mut last_outbound = Instant::now();
+        let mut last_probe = Instant::now();
+        let mut ping_sent = None;
+        loop {
+            let now_ms = unix_ms()?;
+            if let Err(EdgeFailure(error)) = self.edge.tick(session, now_ms) {
+                return self.close_with(session, &mut websocket, error);
+            }
+            if last_probe.elapsed() >= Duration::from_secs(60) {
+                self.edge.poll_localapi();
+                last_probe = Instant::now();
+                if let Err(EdgeFailure(error)) = self.edge.require_ready() {
+                    return self.close_with(session, &mut websocket, error);
+                }
+            }
+            loop {
+                match self.edge.write_next_event(session, &mut websocket) {
+                    Ok(true) => {
+                        last_outbound = Instant::now();
+                        ping_sent = None;
+                    }
+                    Ok(false) => break,
+                    Err(EdgeFailure(error)) => {
+                        return self.close_with(session, &mut websocket, error)
+                    }
+                }
+            }
+            if last_outbound.elapsed() >= Duration::from_secs(30) && ping_sent.is_none() {
+                websocket
+                    .write_ping()
+                    .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                ping_sent = Some(Instant::now());
+            }
+            if ping_sent.is_some_and(|at| at.elapsed() >= Duration::from_secs(10)) {
+                return self.close_with(session, &mut websocket, EdgeError::HeartbeatTimedOut);
+            }
+            match websocket.read_complete_frame(self.edge.config.maximum_message_bytes()) {
+                Ok(InboundFrame::Text(text)) => {
+                    if let Err(EdgeFailure(error)) = self.edge.handle_text(session, &text, now_ms) {
+                        return self.close_with(session, &mut websocket, error);
+                    }
+                }
+                Ok(InboundFrame::Pong) => {
+                    self.edge.note_pong(session, now_ms)?;
+                    ping_sent = None;
+                }
+                Ok(InboundFrame::Close) => {
+                    self.edge.close_session(session)?;
+                    return Ok(());
+                }
+                Err(EdgeError::OutputFailed) => continue,
+                Err(error) => return self.close_with(session, &mut websocket, error),
+            }
+        }
+    }
+
+    fn close_with(
+        &self,
+        session: SessionHandle,
+        websocket: &mut WebSocketConnection,
+        error: EdgeError,
+    ) -> Result<(), EdgeFailure> {
+        let _ = websocket.write_complete_text(&HttpResponse::error(400, error).body);
+        let _ = websocket.write_close(error);
+        let _ = self.edge.close_session(session);
+        Err(EdgeFailure(error))
+    }
+}
+
+fn unix_ms() -> Result<i64, EdgeFailure> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| EdgeFailure(EdgeError::StorageUnavailable))
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
+                .map_err(|_| EdgeFailure(EdgeError::StorageUnavailable))
+        })
 }
 
 fn disallowed_bind_ip(ip: IpAddr) -> bool {
@@ -1418,6 +1664,7 @@ mod tests {
     fn config() -> EdgeConfig {
         EdgeConfig {
             listen_address: "100.64.0.7:8123".parse().unwrap(),
+            state_directory: PathBuf::from("/tmp/clipmesh-r3-test-state"),
             retention_seconds: 60,
             history_max_entries: 500,
             max_payload_bytes: 262_144,
@@ -1638,7 +1885,7 @@ mod tests {
         edge.handle_text(session, message, NOW).unwrap();
         assert_eq!(
             edge.handle_text(session, message, NOW).unwrap_err().0,
-            EdgeError::RequestRateLimited
+            EdgeError::PublishRateLimited
         );
 
         daemon.state.lock().unwrap().available = false;
@@ -1651,7 +1898,24 @@ mod tests {
     }
 
     #[test]
-    fn concrete_localapi_http_and_websocket_path_captures_only_protocol_metadata() {
+    fn peer_connection_and_http_buckets_refill_at_the_specified_rates() {
+        let (_directory, _daemon, edge) = edge();
+        let peer = StablePeerId::from_boundary("peer-reserved-example".to_owned()).unwrap();
+        for _ in 0..10 {
+            assert!(edge.consume_connection_attempt(&peer, NOW));
+        }
+        assert!(!edge.consume_connection_attempt(&peer, NOW));
+        assert!(edge.consume_connection_attempt(&peer, NOW + 2_000));
+
+        for _ in 0..20 {
+            assert!(edge.consume_http_request(&peer, NOW));
+        }
+        assert!(!edge.consume_http_request(&peer, NOW));
+        assert!(edge.consume_http_request(&peer, NOW + 500));
+    }
+
+    #[test]
+    fn mismatched_accepted_socket_is_rejected_before_http_or_whois() {
         let directory = tempdir().unwrap();
         let daemon = LocalApiSimulator::admitted();
         let edge = Arc::new(
@@ -1666,12 +1930,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_edge = Arc::clone(&edge);
         let server = thread::spawn(move || {
-            let (stream, remote) = listener.accept().unwrap();
-            match server_edge.serve_accepted(stream, remote, NOW) {
-                Ok(ServedConnection::Upgraded { session, .. }) => Ok(session),
-                Ok(ServedConnection::Rejected(response)) => Err(response.status),
-                Err(_) => Err(0),
-            }
+            let (stream, _) = listener.accept().unwrap();
+            server_edge.serve_accepted(stream, NOW)
         });
         let mut client = TcpStream::connect(address).unwrap();
         client
@@ -1679,22 +1939,15 @@ mod tests {
             .unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let mut response = Vec::new();
-        client.read_to_end(&mut response).unwrap();
-        let response = String::from_utf8_lossy(&response);
-        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
-        assert!(response.contains("Sec-WebSocket-Protocol: clipmesh.v1\r\n"));
-        assert!(response.contains("server_hello"));
-        assert!(server.join().unwrap().is_ok());
+        let _ = client.read_to_end(&mut response);
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(EdgeFailure(EdgeError::TailnetBindUnverified))
+        ));
         let requests = &daemon.state.lock().unwrap().requests;
         assert!(requests
             .iter()
-            .any(|target| target == "/localapi/v0/status"));
-        assert!(requests
-            .iter()
-            .any(|target| target.starts_with("/localapi/v0/whois?addr=127.0.0.1:")));
-        assert!(requests
-            .iter()
-            .all(|target| !target.contains("peer-reserved-example")));
+            .all(|target| target == "/localapi/v0/status"));
     }
 
     #[test]
@@ -1711,6 +1964,13 @@ mod tests {
         edge.read_websocket_text(session, &mut websocket, NOW)
             .unwrap();
         assert_eq!(drain(&edge, session).len(), 2);
+        client.write_all(&[0x8a, 0x80, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            websocket
+                .read_complete_frame(edge.config().maximum_message_bytes())
+                .unwrap(),
+            InboundFrame::Pong
+        ));
         client.write_all(&[0x82, 0x80, 0, 0, 0, 0]).unwrap();
         assert_eq!(
             edge.read_websocket_text(session, &mut websocket, NOW)
@@ -1760,10 +2020,6 @@ mod tests {
         }
         edge.note_pong(heartbeat, NOW + 44_000).unwrap();
         edge.tick(heartbeat, NOW + 45_000).unwrap();
-        assert_eq!(
-            edge.tick(heartbeat, NOW + 89_001).unwrap_err().0,
-            EdgeError::HeartbeatTimedOut
-        );
     }
 
     #[test]
@@ -1783,10 +2039,7 @@ mod tests {
         edge.handle_text(source, &second, NOW).unwrap();
         drain(&edge, source);
         let third = first.replace("000000000011", "000000000013");
-        assert_eq!(
-            edge.handle_text(source, &third, NOW).unwrap_err().0,
-            EdgeError::SlowConsumer
-        );
+        edge.handle_text(source, &third, NOW).unwrap();
         assert_eq!(
             edge.session_peer(target.id).unwrap_err().0,
             EdgeError::SessionContextStale

@@ -13,9 +13,9 @@ output=$2
 
 if command -v jq >/dev/null 2>&1; then
   jq '
-    if (keys == ["TailscaleIPs"]) and (.TailscaleIPs | type == "array") then
+    if (keys == ["TailscaleIPs"]) and (.TailscaleIPs | type == "array") and (.TailscaleIPs | all(type == "string" and length > 0)) then
       {TailscaleIPs: (.TailscaleIPs | map("[redacted]"))}
-    elif (keys == ["Node"]) and (.Node | type == "object") and (.Node | keys == ["StableID"]) then
+    elif (keys == ["Node"]) and (.Node | type == "object") and (.Node | keys == ["StableID"]) and (.Node.StableID | type == "string" and length > 0) then
       {Node: {StableID: "[redacted]"}}
     else error("unexpected LocalAPI schema") end
   ' "$input" >"$output"
