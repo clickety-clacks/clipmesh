@@ -287,9 +287,9 @@ fn peer_uid(stream: &UnixStream) -> Result<libc::uid_t, MacAdapterError> {
                 &mut length,
             )
         };
-        return (result == 0 && length as usize == std::mem::size_of::<libc::ucred>())
+        (result == 0 && length as usize == std::mem::size_of::<libc::ucred>())
             .then_some(credentials.uid)
-            .ok_or(MacAdapterError::StatePathInsecure);
+            .ok_or(MacAdapterError::StatePathInsecure)
     }
 
     #[cfg(not(any(
