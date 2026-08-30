@@ -65,6 +65,14 @@ if scripts/render-r7-packaging.py "$scratch/root-parent" <"$scratch/root-parent-
   exit 1
 fi
 
+jq '.CLIPMESH_CONTROL_SOCKET = "/opt/clipmesh/agent state/control.sock"' \
+  "$scratch/render-values.json" >"$scratch/whitespace-path-values.json"
+if scripts/render-r7-packaging.py "$scratch/whitespace-path" \
+  <"$scratch/whitespace-path-values.json"; then
+  printf 'R7 renderer accepted a whitespace-split systemd state path\n' >&2
+  exit 1
+fi
+
 mkdir "$scratch/existing"
 if scripts/render-r7-packaging.py "$scratch/existing" <"$scratch/render-values.json"; then
   printf 'R7 renderer overwrote an existing directory\n' >&2

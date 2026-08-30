@@ -27,6 +27,11 @@ DERIVED_PATH_TOKENS = {
     "CLIPMESH_AGENT_STATE_DIRECTORY": "CLIPMESH_STATE_PATH",
     "CLIPMESH_AGENT_CONTROL_DIRECTORY": "CLIPMESH_CONTROL_SOCKET",
 }
+SYSTEMD_STATE_PATH_TOKENS = (
+    "CLIPMESH_HUB_STATE_DIRECTORY",
+    "CLIPMESH_STATE_PATH",
+    "CLIPMESH_CONTROL_SOCKET",
+)
 
 
 def fail(message: str) -> NoReturn:
@@ -78,6 +83,9 @@ def main() -> None:
         fail(f"missing variables: {','.join(missing)}")
     if unknown:
         fail(f"unknown variables: {','.join(unknown)}")
+    for source in SYSTEMD_STATE_PATH_TOKENS:
+        if any(character.isspace() for character in values[source]):
+            fail(f"{source} must not contain whitespace")
     for target, source in DERIVED_PATH_TOKENS.items():
         path = Path(values[source])
         if not path.is_absolute() or path.parent == Path("/"):
