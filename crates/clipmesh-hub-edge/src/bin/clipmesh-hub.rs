@@ -24,9 +24,5 @@ fn run() -> Result<(), &'static str> {
     let text = fs::read_to_string(path).map_err(|_| "config_parse_failed")?;
     let config = EdgeConfig::parse_toml(&text).map_err(|error| error.code())?;
     let listener = HubEdge::bind(config).map_err(|error| error.0.code())?;
-    loop {
-        listener
-            .accept_and_serve()
-            .map_err(|error| error.0.code())?;
-    }
+    listener.serve().map_err(|error| error.0.code())
 }

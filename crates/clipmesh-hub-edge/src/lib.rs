@@ -11,7 +11,8 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -568,7 +569,7 @@ impl RateBucket {
 /// Owns the one configured application listener. It is inert until a caller
 /// explicitly invokes [`HubEdge::bind`]; no executable activates it by default.
 pub struct HubListener {
-    edge: HubEdge,
+    edge: Arc<HubEdge>,
     listener: TcpListener,
 }
 
@@ -771,7 +772,10 @@ impl HubEdge {
         {
             return Err(EdgeFailure(EdgeError::BindFailed));
         }
-        Ok(HubListener { edge, listener })
+        Ok(HubListener {
+            edge: Arc::new(edge),
+            listener,
+        })
     }
 
     pub fn config(&self) -> &EdgeConfig {
@@ -844,7 +848,6 @@ impl HubEdge {
         {
             return Err(EdgeFailure(EdgeError::TailnetBindUnverified));
         }
-        self.require_ready()?;
         let observed_remote = stream
             .peer_addr()
             .map_err(|_| EdgeFailure(EdgeError::TailnetPeerUnverified))?;
@@ -872,6 +875,7 @@ impl HubEdge {
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
             return Ok(ServedConnection::Rejected(response));
         }
+        self.require_ready()?;
         if let Some(response) = validate_http(&request) {
             write_http_response(&mut stream, &response)
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
@@ -1340,110 +1344,159 @@ impl HubListener {
         self.edge.serve_accepted(stream, now_ms)
     }
 
+    /// Runs the production listener. Accepted sockets receive independent
+    /// session workers, while this owner continues admission and the periodic
+    /// LocalAPI readiness probe.
+    pub fn serve(&self) -> Result<(), EdgeFailure> {
+        self.serve_until(Duration::from_secs(60), || true)
+    }
+
+    fn serve_until(
+        &self,
+        probe_interval: Duration,
+        mut keep_running: impl FnMut() -> bool,
+    ) -> Result<(), EdgeFailure> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|_| EdgeFailure(EdgeError::BindFailed))?;
+        let mut last_probe = Instant::now();
+        while keep_running() {
+            if last_probe.elapsed() >= probe_interval {
+                self.edge.poll_localapi();
+                last_probe = Instant::now();
+            }
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    let edge = Arc::clone(&self.edge);
+                    thread::Builder::new()
+                        .name("clipmesh-hub-session".to_owned())
+                        .spawn(move || {
+                            let _ = serve_socket(&edge, stream);
+                        })
+                        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return Err(EdgeFailure(EdgeError::BindFailed)),
+            }
+        }
+        Ok(())
+    }
+
     /// Owns the post-upgrade session lifecycle: output drain, ping interval,
     /// LocalAPI probe, text admission, failure frame, and close frame.
     pub fn accept_and_serve(&self) -> Result<(), EdgeFailure> {
-        let started = unix_ms()?;
-        let ServedConnection::Upgraded {
-            session,
-            mut websocket,
-        } = self.accept_once(started)?
-        else {
-            return Ok(());
-        };
-        websocket
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
-        let mut last_outbound = Instant::now();
-        let mut last_probe = Instant::now();
-        let mut ping_sent = None;
+        let (stream, _) = self
+            .listener
+            .accept()
+            .map_err(|_| EdgeFailure(EdgeError::BindFailed))?;
+        serve_socket(&self.edge, stream)
+    }
+}
+
+fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
+    let started = unix_ms()?;
+    let ServedConnection::Upgraded {
+        session,
+        mut websocket,
+    } = edge.serve_accepted(stream, started)?
+    else {
+        return Ok(());
+    };
+    websocket
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+    let mut last_outbound = Instant::now();
+    let mut last_probe = Instant::now();
+    let mut ping_sent = None;
+    loop {
+        let now_ms = unix_ms()?;
+        if let Some(error) = edge.take_terminal_error(session)? {
+            return close_with(edge, session, &mut websocket, error, None);
+        }
+        if let Err(EdgeFailure(error)) = edge.tick(session, now_ms) {
+            return close_with(edge, session, &mut websocket, error, None);
+        }
+        if last_probe.elapsed() >= Duration::from_secs(60) {
+            edge.poll_localapi();
+            last_probe = Instant::now();
+            if let Err(EdgeFailure(error)) = edge.require_ready() {
+                return close_with(edge, session, &mut websocket, error, None);
+            }
+        }
         loop {
-            let now_ms = unix_ms()?;
-            if let Some(error) = self.edge.take_terminal_error(session)? {
-                return self.close_with(session, &mut websocket, error, None);
-            }
-            if let Err(EdgeFailure(error)) = self.edge.tick(session, now_ms) {
-                return self.close_with(session, &mut websocket, error, None);
-            }
-            if last_probe.elapsed() >= Duration::from_secs(60) {
-                self.edge.poll_localapi();
-                last_probe = Instant::now();
-                if let Err(EdgeFailure(error)) = self.edge.require_ready() {
-                    return self.close_with(session, &mut websocket, error, None);
-                }
-            }
-            loop {
-                match self.edge.write_next_event(session, &mut websocket) {
-                    Ok(true) => {
-                        last_outbound = Instant::now();
-                        ping_sent = None;
-                    }
-                    Ok(false) => break,
-                    Err(EdgeFailure(error)) => {
-                        return self.close_with(session, &mut websocket, error, None)
-                    }
-                }
-            }
-            if last_outbound.elapsed() >= Duration::from_secs(30) && ping_sent.is_none() {
-                websocket
-                    .write_ping()
-                    .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
-                ping_sent = Some(Instant::now());
-            }
-            if ping_sent.is_some_and(|at| at.elapsed() >= Duration::from_secs(10)) {
-                return self.close_with(
-                    session,
-                    &mut websocket,
-                    EdgeError::HeartbeatTimedOut,
-                    None,
-                );
-            }
-            match websocket.read_complete_frame(self.edge.config.maximum_message_bytes()) {
-                Ok(InboundFrame::Text(text)) => {
-                    if let Err(EdgeFailure(error)) = self.edge.handle_text(session, &text, now_ms) {
-                        websocket
-                            .write_complete_text(&websocket_failure_frame(Some(&text), error))
-                            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
-                        if websocket_failure_closes(error) {
-                            let _ = websocket.write_close(error);
-                            let _ = self.edge.close_session(session);
-                            return Err(EdgeFailure(error));
-                        }
-                    }
-                }
-                Ok(InboundFrame::Pong) => {
-                    self.edge.note_pong(session, now_ms)?;
+            match edge.write_next_event(session, &mut websocket) {
+                Ok(true) => {
+                    last_outbound = Instant::now();
                     ping_sent = None;
                 }
-                Ok(InboundFrame::Close) => {
-                    self.edge.close_session(session)?;
-                    return Ok(());
-                }
-                Err(FrameReadFailure::Timeout) => continue,
-                Err(FrameReadFailure::Disconnected) => {
-                    self.edge.close_session(session)?;
-                    return Ok(());
-                }
-                Err(FrameReadFailure::Protocol(error)) => {
-                    return self.close_with(session, &mut websocket, error, None)
+                Ok(false) => break,
+                Err(EdgeFailure(error)) => {
+                    return close_with(edge, session, &mut websocket, error, None)
                 }
             }
         }
+        if last_outbound.elapsed() >= Duration::from_secs(30) && ping_sent.is_none() {
+            websocket
+                .write_ping()
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+            ping_sent = Some(Instant::now());
+        }
+        if ping_sent.is_some_and(|at| at.elapsed() >= Duration::from_secs(10)) {
+            return close_with(
+                edge,
+                session,
+                &mut websocket,
+                EdgeError::HeartbeatTimedOut,
+                None,
+            );
+        }
+        match websocket.read_complete_frame(edge.config.maximum_message_bytes()) {
+            Ok(InboundFrame::Text(text)) => {
+                if let Err(EdgeFailure(error)) = edge.handle_text(session, &text, now_ms) {
+                    websocket
+                        .write_complete_text(&websocket_failure_frame(Some(&text), error))
+                        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                    if websocket_failure_closes(error) {
+                        let _ = websocket.write_close(error);
+                        let _ = edge.close_session(session);
+                        return Err(EdgeFailure(error));
+                    }
+                }
+            }
+            Ok(InboundFrame::Pong) => {
+                edge.note_pong(session, now_ms)?;
+                ping_sent = None;
+            }
+            Ok(InboundFrame::Close) => {
+                edge.close_session(session)?;
+                return Ok(());
+            }
+            Err(FrameReadFailure::Timeout) => continue,
+            Err(FrameReadFailure::Disconnected) => {
+                edge.close_session(session)?;
+                return Ok(());
+            }
+            Err(FrameReadFailure::Protocol(error)) => {
+                return close_with(edge, session, &mut websocket, error, None)
+            }
+        }
     }
+}
 
-    fn close_with(
-        &self,
-        session: SessionHandle,
-        websocket: &mut WebSocketConnection,
-        error: EdgeError,
-        input: Option<&str>,
-    ) -> Result<(), EdgeFailure> {
-        let _ = websocket.write_complete_text(&websocket_failure_frame(input, error));
-        let _ = websocket.write_close(error);
-        let _ = self.edge.close_session(session);
-        Err(EdgeFailure(error))
-    }
+fn close_with(
+    edge: &HubEdge,
+    session: SessionHandle,
+    websocket: &mut WebSocketConnection,
+    error: EdgeError,
+    input: Option<&str>,
+) -> Result<(), EdgeFailure> {
+    let _ = websocket.write_complete_text(&websocket_failure_frame(input, error));
+    let _ = websocket.write_close(error);
+    let _ = edge.close_session(session);
+    Err(EdgeFailure(error))
 }
 
 fn websocket_failure_frame(input: Option<&str>, error: EdgeError) -> String {
@@ -1840,7 +1893,10 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         os::unix::net::UnixListener,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         thread,
         time::Duration,
     };
@@ -2090,6 +2146,25 @@ mod tests {
                 .map(|(index, byte)| byte ^ mask[index % 4]),
         );
         frame
+    }
+
+    fn connect_websocket(address: SocketAddr) -> TcpStream {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(b"GET /v1/stream HTTP/1.1\r\nHost: simulator\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: clipmesh.v1\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        while !response
+            .windows(b"server_hello".len())
+            .any(|window| window == b"server_hello")
+        {
+            let mut chunk = [0_u8; 1024];
+            let size = client.read(&mut chunk).unwrap();
+            assert_ne!(size, 0, "connection closed before server_hello");
+            response.extend_from_slice(&chunk[..size]);
+        }
+        client
     }
 
     fn live(edge: &HubEdge) -> SessionHandle {
@@ -2497,6 +2572,117 @@ mod tests {
             .contains("101 Switching Protocols"));
         client.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
         assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn production_loop_serves_concurrent_peers_and_isolates_session_failure() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let listener = HubEdge::bind_for_test(configured, daemon.client()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            listener.serve_until(Duration::from_secs(60), || {
+                !server_stop.load(Ordering::SeqCst)
+            })
+        });
+
+        let mut first = connect_websocket(address);
+        let mut second = connect_websocket(address);
+        first.write_all(&[0x81, 0x00]).unwrap();
+        let mut third = connect_websocket(address);
+
+        second.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
+        third.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn production_loop_probes_localapi_while_idle() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let listener = HubEdge::bind_for_test(configured, daemon.client()).unwrap();
+        let edge = Arc::clone(&listener.edge);
+        daemon.state.lock().unwrap().available = false;
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            listener.serve_until(Duration::from_millis(20), || {
+                !server_stop.load(Ordering::SeqCst)
+            })
+        });
+
+        for _ in 0..100 {
+            if edge.readiness().status == 503 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(edge.readiness().status, 503);
+        stop.store(true, Ordering::SeqCst);
+        assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn concrete_readiness_http_reports_terminal_counter_failure() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let database = directory.path().join("hub.sqlite");
+        drop(HubCore::open(&database, clipmesh_hub_core::RetentionLimits::default()).unwrap());
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE hub_meta SET cursor_high_water=?1 WHERE singleton=1",
+                params![format!("{:020}", u64::MAX)],
+            )
+            .unwrap();
+        drop(connection);
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let edge = Arc::new(HubEdge::prepare(configured, daemon.client(), database).unwrap());
+        let session = live(&edge);
+        let publish = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"00000000-0000-4000-8000-000000000043","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}"#;
+        assert!(matches!(
+            edge.handle_text(session, publish, NOW),
+            Err(EdgeFailure(EdgeError::HubCursorExhausted))
+        ));
+        let server_edge = Arc::clone(&edge);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server_edge.serve_accepted(stream, NOW)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: simulator\r\n\r\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"));
+        assert!(response.contains(r#"{"status":"not_ready","reason_code":"hub_cursor_exhausted"}"#));
+        assert!(matches!(
+            server.join().unwrap(),
+            Ok(ServedConnection::Rejected(HttpResponse { status: 503, .. }))
+        ));
     }
 
     #[test]
