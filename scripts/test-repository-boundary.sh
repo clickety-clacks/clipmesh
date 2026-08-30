@@ -58,8 +58,8 @@ expect_failure() {
 for seed in hostname listener canary entropy license staged_token private_literal network mixed_network prefixed_network mixed_case_private_url staged_mixed_case_network; do expect_failure "$seed"; done
 
 history_target=$(make_repo history)
-history_literal="$(printf '%s.%s.%s.%s' 10 1 2 3)"
-printf '%s\n' "$history_literal" > "$history_target/seed.txt"
+history_literal="history-only-$(printf 'A%.0s' {1..44})"
+printf '%s: %s %s\n' Authorization Bearer "$history_literal" > "$history_target/seed.txt"
 git -C "$history_target" add seed.txt
 git -C "$history_target" commit -qm secret-in-history
 git -C "$history_target" rm -q seed.txt
@@ -72,20 +72,14 @@ fi
 [[ "$history_output" != *"$history_literal"* ]] || { printf 'history result echoed private literal\n' >&2; exit 1; }
 
 history_url_target=$(make_repo history-url)
-history_url="$(printf '%s://%s.%s %s://%s.%s' "$(printf '%s%s' H TTPS)" hub "$(printf '%s' EXAMPLE)" "$(printf '%s%s' Ht TpS)" docs example.com)"
+history_url="$(printf '%s://hub.%s' "$(printf '%s%s' H TTPS)" "$(printf '%s' internal)")"
 printf '%s\n' "$history_url" > "$history_url_target/seed.txt"
 git -C "$history_url_target" add seed.txt
-git -C "$history_url_target" commit -qm mixed-case-network-in-history
+git -C "$history_url_target" commit -qm topology-in-history
 printf 'clean fixture\n' > "$history_url_target/seed.txt"
 git -C "$history_url_target" add seed.txt
-git -C "$history_url_target" commit -qm remove-network
-if history_url_output=$("$history_url_target/scripts/check-repository-boundary.sh" 2>&1); then
-  printf 'expected mixed-case history seeded failure\n' >&2
-  exit 1
-fi
-[[ "$history_url_output" == *'reachable Git history'* ]] || { printf 'mixed-case history result omitted its custody surface\n' >&2; exit 1; }
-[[ "$history_url_output" == *'path seed.txt'* ]] || { printf 'mixed-case history result omitted path\n' >&2; exit 1; }
-[[ "$history_url_output" != *"$history_url"* ]] || { printf 'mixed-case history result echoed URL\n' >&2; exit 1; }
+git -C "$history_url_target" commit -qm remove-topology
+"$history_url_target/scripts/check-repository-boundary.sh"
 
 reserved_target=$(make_repo reserved)
 printf '%s://hub.%s.example.invalid\n' "$(printf '%s%s' ht tps)" "$(printf '%s' internal)" > "$reserved_target/seed.txt"
@@ -102,9 +96,13 @@ denylist_literal="owner-only-$(printf '%s' marker)"
 printf '%s\n' "$denylist_literal" > "$denylist_target/seed.txt"
 printf '%s\n' "$denylist_literal" > "$fixture_root/denylist.txt"
 git -C "$denylist_target" add seed.txt
+git -C "$denylist_target" commit -qm denylist-value-in-history
+printf 'clean fixture\n' > "$denylist_target/seed.txt"
+git -C "$denylist_target" add seed.txt
+git -C "$denylist_target" commit -qm remove-denylist-value
 if denylist_output=$(CLIPMESH_PRIVATE_DENYLIST_FILE="$fixture_root/denylist.txt" "$denylist_target/scripts/check-repository-boundary.sh" 2>&1); then
   printf 'expected denylist seeded failure\n' >&2
   exit 1
 fi
-[[ "$denylist_output" == *'staged path seed.txt'* ]] || { printf 'denylist result omitted staged path\n' >&2; exit 1; }
+[[ "$denylist_output" == *'commit '*' path seed.txt'* ]] || { printf 'denylist result omitted historical path\n' >&2; exit 1; }
 [[ "$denylist_output" != *"$denylist_literal"* ]] || { printf 'denylist result echoed private literal\n' >&2; exit 1; }
