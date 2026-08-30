@@ -708,6 +708,34 @@ pub struct HubEdge {
     runtime: Mutex<Runtime>,
 }
 
+struct SessionCleanupGuard<'a> {
+    edge: &'a HubEdge,
+    session: SessionHandle,
+    armed: bool,
+}
+
+impl<'a> SessionCleanupGuard<'a> {
+    fn new(edge: &'a HubEdge, session: SessionHandle) -> Self {
+        Self {
+            edge,
+            session,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.edge.close_session(self.session);
+        }
+    }
+}
+
 impl HubEdge {
     /// Validates config and current LocalAPI status before opening hub state.
     /// It does not bind or activate a listener.
@@ -889,6 +917,7 @@ impl HubEdge {
                 return Ok(ServedConnection::Rejected(response));
             }
         };
+        let cleanup = SessionCleanupGuard::new(self, session);
         let key = request
             .headers
             .iter()
@@ -909,6 +938,8 @@ impl HubEdge {
         entry.opened_at_ms = now_ms;
         entry.last_activity_ms = now_ms;
         entry.last_pong_ms = now_ms;
+        drop(sessions);
+        cleanup.disarm();
         Ok(ServedConnection::Upgraded { session, websocket })
     }
 
@@ -1404,6 +1435,7 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
     else {
         return Ok(());
     };
+    let _cleanup = SessionCleanupGuard::new(edge, session);
     websocket
         .stream
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -2572,6 +2604,52 @@ mod tests {
             .contains("101 Switching Protocols"));
         client.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
         assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn handshake_output_failure_releases_the_registered_session() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        configured.max_connections = 1;
+        configured.max_connections_per_peer = 1;
+        let edge = Arc::new(
+            HubEdge::prepare(
+                configured,
+                daemon.client(),
+                directory.path().join("hub.sqlite"),
+            )
+            .unwrap(),
+        );
+        let server_edge = Arc::clone(&edge);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            server_edge.serve_accepted(stream, NOW)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(b"GET /v1/stream HTTP/1.1\r\nHost: simulator\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: clipmesh.v1\r\n\r\n").unwrap();
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(EdgeFailure(EdgeError::OutputFailed))
+        ));
+        assert!(edge.sessions.lock().unwrap().entries.is_empty());
+
+        let admitted = edge
+            .admit_socket("127.0.0.1:12345".parse().unwrap())
+            .unwrap();
+        let replacement = match edge.upgrade(admitted, &request()) {
+            UpgradeResult::Upgraded(session) => session,
+            UpgradeResult::Response(response) => {
+                panic!("failed output retained the connection slot: {response:?}")
+            }
+        };
+        edge.close_session(replacement).unwrap();
     }
 
     #[test]
