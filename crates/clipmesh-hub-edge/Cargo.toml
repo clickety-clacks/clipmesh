@@ -16,4 +16,5 @@ toml = "0.8"
 uuid = "1"
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"

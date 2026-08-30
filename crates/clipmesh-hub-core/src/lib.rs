@@ -298,7 +298,23 @@ struct State {
     clear_generation: u64,
     cursor_high_water: u64,
     lost_through_cursor: Option<u64>,
+    terminal_failure: Option<TerminalFailure>,
     sessions: HashMap<Uuid, Session>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalFailure {
+    HubCursorExhausted,
+    ClearGenerationExhausted,
+}
+
+impl TerminalFailure {
+    fn code(self) -> FailureCode {
+        match self {
+            Self::HubCursorExhausted => FailureCode::HubCursorExhausted,
+            Self::ClearGenerationExhausted => FailureCode::ClearGenerationExhausted,
+        }
+    }
 }
 
 /// One queued event whose transport handoff remains ordered with hub mutations.
@@ -374,6 +390,7 @@ impl HubCore {
                 clear_generation,
                 cursor_high_water,
                 lost_through_cursor,
+                terminal_failure: None,
                 sessions: HashMap::new(),
             }),
         })
@@ -408,6 +425,15 @@ impl HubCore {
             .lock()
             .expect("hub state lock poisoned")
             .clear_generation
+    }
+
+    /// Returns the content-free terminal reason that makes hub readiness false.
+    pub fn readiness_failure(&self) -> Option<FailureCode> {
+        self.state
+            .lock()
+            .expect("hub state lock poisoned")
+            .terminal_failure
+            .map(TerminalFailure::code)
     }
 
     pub fn open_session(&self, peer_id: StablePeerId) -> SessionHello {
@@ -605,6 +631,7 @@ impl HubCore {
         now_ms: i64,
     ) -> Result<PublishAccepted, CoreError> {
         let mut state = self.state.lock().expect("hub state lock poisoned");
+        require_mutation_ready(&state)?;
         require_session_exists(&state, session_id)?;
         compare_generation(input.clear_generation, state.clear_generation)?;
         let source_peer_id = require_live_session(&state, session_id)?;
@@ -641,10 +668,13 @@ impl HubCore {
         if input.content.as_storage_blob().len() > self.limits.max_payload_bytes {
             return Err(CoreError::Failure(FailureCode::PayloadTooLarge));
         }
-        let cursor = state
-            .cursor_high_water
-            .checked_add(1)
-            .ok_or(CoreError::Failure(FailureCode::HubCursorExhausted))?;
+        let cursor = match state.cursor_high_water.checked_add(1) {
+            Some(cursor) => cursor,
+            None => {
+                state.terminal_failure = Some(TerminalFailure::HubCursorExhausted);
+                return Err(CoreError::Failure(FailureCode::HubCursorExhausted));
+            }
+        };
         let expires_at_ms = now_ms.saturating_add(retention_ms);
         let clip = RetainedClip {
             cursor,
@@ -680,6 +710,7 @@ impl HubCore {
         now_ms: i64,
     ) -> Result<PublishPreflight, CoreError> {
         let state = self.state.lock().expect("hub state lock poisoned");
+        require_mutation_ready(&state)?;
         require_session_exists(&state, session_id)?;
         compare_generation(clear_generation, state.clear_generation)?;
         require_live_session(&state, session_id)?;
@@ -746,6 +777,7 @@ impl HubCore {
         expected_clear_generation: u64,
     ) -> Result<ClearAccepted, CoreError> {
         let mut state = self.state.lock().expect("hub state lock poisoned");
+        require_mutation_ready(&state)?;
         require_session_exists(&state, session_id)?;
         if let Some(receipt) = load_clear_receipt(&state.connection, request_id)? {
             if receipt.0 != expected_clear_generation {
@@ -762,10 +794,13 @@ impl HubCore {
         }
         compare_generation(expected_clear_generation, state.clear_generation)?;
         require_live_session(&state, session_id)?;
-        let next_generation = state
-            .clear_generation
-            .checked_add(1)
-            .ok_or(CoreError::Failure(FailureCode::ClearGenerationExhausted))?;
+        let next_generation = match state.clear_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                state.terminal_failure = Some(TerminalFailure::ClearGenerationExhausted);
+                return Err(CoreError::Failure(FailureCode::ClearGenerationExhausted));
+            }
+        };
         let cleared_through_cursor = nonzero(state.cursor_high_water);
         let tx = state
             .connection
@@ -990,6 +1025,12 @@ fn require_active_session(state: &State, session_id: Uuid) -> Result<(), CoreErr
         return Err(CoreError::Failure(FailureCode::SessionContextStale));
     }
     Ok(())
+}
+
+fn require_mutation_ready(state: &State) -> Result<(), CoreError> {
+    state
+        .terminal_failure
+        .map_or(Ok(()), |failure| Err(CoreError::Failure(failure.code())))
 }
 
 fn require_session_exists(state: &State, session_id: Uuid) -> Result<(), CoreError> {
@@ -1322,6 +1363,53 @@ mod tests {
         (directory, core)
     }
 
+    fn core_with_counter_at_max(column: &str) -> (tempfile::TempDir, HubCore) {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("hub.sqlite3");
+        drop(HubCore::open(&database, RetentionLimits::default()).unwrap());
+        let connection = Connection::open(&database).unwrap();
+        match column {
+            "cursor_high_water" => {
+                connection
+                    .execute(
+                        "UPDATE hub_meta SET cursor_high_water=?1 WHERE singleton=1",
+                        params![counter_key(u64::MAX)],
+                    )
+                    .unwrap();
+            }
+            "clear_generation" => {
+                connection
+                    .execute(
+                        "UPDATE hub_meta SET clear_generation=?1 WHERE singleton=1",
+                        params![counter_key(u64::MAX)],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!("test counter is closed"),
+        }
+        drop(connection);
+        let core = HubCore::open(database, RetentionLimits::default()).unwrap();
+        (directory, core)
+    }
+
+    fn durable_mutation_state(core: &HubCore) -> (u64, u64, usize, usize) {
+        let state = core.state.lock().unwrap();
+        let clips = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+            .unwrap();
+        let receipts = state
+            .connection
+            .query_row("SELECT COUNT(*) FROM clear_receipts", [], |row| row.get(0))
+            .unwrap();
+        (
+            state.cursor_high_water,
+            state.clear_generation,
+            clips,
+            receipts,
+        )
+    }
+
     fn live(core: &HubCore, name: &str) -> SessionHello {
         let hello = core.open_session(peer(name));
         let plan = core
@@ -1371,6 +1459,60 @@ mod tests {
         assert_eq!(format!("{stored:?}"), "ClipContentV1([redacted])");
         assert_eq!(format!("{wire:?}"), "WireContentV1([redacted])");
         assert!(!format!("{:?}", peer("peer-secret")).contains("peer-secret"));
+    }
+
+    #[test]
+    fn cursor_max_marks_readiness_false_without_wrap_or_later_publish() {
+        let (_directory, core) = core_with_counter_at_max("cursor_high_water");
+        let source = live(&core, "peer-a");
+        let before = durable_mutation_state(&core);
+        assert_eq!(core.readiness_failure(), None);
+
+        assert_eq!(
+            core.publish(
+                source.session_id,
+                publish_input(Uuid::new_v4(), 1, "first"),
+                NOW,
+            ),
+            Err(CoreError::Failure(FailureCode::HubCursorExhausted))
+        );
+        assert_eq!(
+            core.readiness_failure(),
+            Some(FailureCode::HubCursorExhausted)
+        );
+        assert_eq!(durable_mutation_state(&core), before);
+        assert_eq!(
+            core.publish(
+                source.session_id,
+                publish_input(Uuid::new_v4(), 1, "second"),
+                NOW,
+            ),
+            Err(CoreError::Failure(FailureCode::HubCursorExhausted))
+        );
+        assert_eq!(durable_mutation_state(&core), before);
+    }
+
+    #[test]
+    fn clear_generation_max_marks_readiness_false_without_wrap_or_later_clear() {
+        let (_directory, core) = core_with_counter_at_max("clear_generation");
+        let source = live(&core, "peer-a");
+        let before = durable_mutation_state(&core);
+        assert_eq!(core.readiness_failure(), None);
+
+        assert_eq!(
+            core.clear_history(source.session_id, Uuid::new_v4(), u64::MAX),
+            Err(CoreError::Failure(FailureCode::ClearGenerationExhausted))
+        );
+        assert_eq!(
+            core.readiness_failure(),
+            Some(FailureCode::ClearGenerationExhausted)
+        );
+        assert_eq!(durable_mutation_state(&core), before);
+        assert_eq!(
+            core.clear_history(source.session_id, Uuid::new_v4(), u64::MAX),
+            Err(CoreError::Failure(FailureCode::ClearGenerationExhausted))
+        );
+        assert_eq!(durable_mutation_state(&core), before);
     }
 
     #[test]

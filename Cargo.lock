@@ -301,6 +301,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clipmesh-hub-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha1",

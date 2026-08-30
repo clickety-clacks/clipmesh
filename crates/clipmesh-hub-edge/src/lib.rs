@@ -1102,12 +1102,7 @@ impl HubEdge {
     }
 
     pub fn readiness(&self) -> HttpResponse {
-        match self
-            .runtime
-            .lock()
-            .expect("edge runtime lock poisoned")
-            .not_ready
-        {
+        match self.readiness_reason() {
             None => HttpResponse {
                 status: 200,
                 body: "{\"status\":\"ready\",\"protocol_version\":1}".to_owned(),
@@ -1122,6 +1117,15 @@ impl HubEdge {
         }
     }
 
+    fn readiness_reason(&self) -> Option<EdgeError> {
+        let runtime_reason = self
+            .runtime
+            .lock()
+            .expect("edge runtime lock poisoned")
+            .not_ready;
+        runtime_reason.or_else(|| self.core.readiness_failure().map(core_failure_code))
+    }
+
     fn session_peer(&self, session_id: Uuid) -> Result<StablePeerId, EdgeFailure> {
         self.sessions
             .lock()
@@ -1133,10 +1137,7 @@ impl HubEdge {
     }
 
     fn require_ready(&self) -> Result<(), EdgeFailure> {
-        self.runtime
-            .lock()
-            .expect("edge runtime lock poisoned")
-            .not_ready
+        self.readiness_reason()
             .map_or(Ok(()), |reason| Err(EdgeFailure(reason)))
     }
 
@@ -1774,33 +1775,37 @@ fn parse_u64(value: String) -> Result<u64, EdgeFailure> {
 
 fn core_error(error: CoreError) -> EdgeError {
     match error {
-        CoreError::Failure(code) => match code {
-            CoreFailureCode::ConfigValueInvalid => EdgeError::ConfigValueInvalid,
-            CoreFailureCode::TailnetPeerUnverified => EdgeError::TailnetPeerUnverified,
-            CoreFailureCode::DatabaseSchemaUnsupported => EdgeError::DatabaseSchemaUnsupported,
-            CoreFailureCode::DatabaseIntegrityFailed => EdgeError::DatabaseIntegrityFailed,
-            CoreFailureCode::StorageUnavailable => EdgeError::StorageUnavailable,
-            CoreFailureCode::SessionContextStale => EdgeError::SessionContextStale,
-            CoreFailureCode::ResumeContextIncomplete => EdgeError::ResumeContextIncomplete,
-            CoreFailureCode::ResumeCursorWithoutContext => EdgeError::ResumeCursorWithoutContext,
-            CoreFailureCode::CursorAhead => EdgeError::CursorAhead,
-            CoreFailureCode::ClearGenerationStale => EdgeError::ClearGenerationStale,
-            CoreFailureCode::ClearGenerationAhead => EdgeError::ClearGenerationAhead,
-            CoreFailureCode::ClearGenerationExhausted => EdgeError::ClearGenerationExhausted,
-            CoreFailureCode::RequestIdConflict => EdgeError::RequestIdConflict,
-            CoreFailureCode::MessageIdConflict => EdgeError::MessageIdConflict,
-            CoreFailureCode::MessageIdReplay => EdgeError::MessageIdReplay,
-            CoreFailureCode::CreatedAtInFuture => EdgeError::CreatedAtInFuture,
-            CoreFailureCode::EventTooOld => EdgeError::EventTooOld,
-            CoreFailureCode::ContentTypeUnsupported => EdgeError::ContentTypeUnsupported,
-            CoreFailureCode::PayloadEmpty => EdgeError::PayloadEmpty,
-            CoreFailureCode::PayloadTooLarge => EdgeError::PayloadTooLarge,
-            CoreFailureCode::PayloadEncodingInvalid => EdgeError::PayloadEncodingInvalid,
-            CoreFailureCode::PayloadLengthMismatch => EdgeError::PayloadLengthMismatch,
-            CoreFailureCode::PayloadHashMismatch => EdgeError::PayloadHashMismatch,
-            CoreFailureCode::HubCursorExhausted => EdgeError::HubCursorExhausted,
-            CoreFailureCode::AckInvalid => EdgeError::AckInvalid,
-        },
+        CoreError::Failure(code) => core_failure_code(code),
+    }
+}
+
+fn core_failure_code(code: CoreFailureCode) -> EdgeError {
+    match code {
+        CoreFailureCode::ConfigValueInvalid => EdgeError::ConfigValueInvalid,
+        CoreFailureCode::TailnetPeerUnverified => EdgeError::TailnetPeerUnverified,
+        CoreFailureCode::DatabaseSchemaUnsupported => EdgeError::DatabaseSchemaUnsupported,
+        CoreFailureCode::DatabaseIntegrityFailed => EdgeError::DatabaseIntegrityFailed,
+        CoreFailureCode::StorageUnavailable => EdgeError::StorageUnavailable,
+        CoreFailureCode::SessionContextStale => EdgeError::SessionContextStale,
+        CoreFailureCode::ResumeContextIncomplete => EdgeError::ResumeContextIncomplete,
+        CoreFailureCode::ResumeCursorWithoutContext => EdgeError::ResumeCursorWithoutContext,
+        CoreFailureCode::CursorAhead => EdgeError::CursorAhead,
+        CoreFailureCode::ClearGenerationStale => EdgeError::ClearGenerationStale,
+        CoreFailureCode::ClearGenerationAhead => EdgeError::ClearGenerationAhead,
+        CoreFailureCode::ClearGenerationExhausted => EdgeError::ClearGenerationExhausted,
+        CoreFailureCode::RequestIdConflict => EdgeError::RequestIdConflict,
+        CoreFailureCode::MessageIdConflict => EdgeError::MessageIdConflict,
+        CoreFailureCode::MessageIdReplay => EdgeError::MessageIdReplay,
+        CoreFailureCode::CreatedAtInFuture => EdgeError::CreatedAtInFuture,
+        CoreFailureCode::EventTooOld => EdgeError::EventTooOld,
+        CoreFailureCode::ContentTypeUnsupported => EdgeError::ContentTypeUnsupported,
+        CoreFailureCode::PayloadEmpty => EdgeError::PayloadEmpty,
+        CoreFailureCode::PayloadTooLarge => EdgeError::PayloadTooLarge,
+        CoreFailureCode::PayloadEncodingInvalid => EdgeError::PayloadEncodingInvalid,
+        CoreFailureCode::PayloadLengthMismatch => EdgeError::PayloadLengthMismatch,
+        CoreFailureCode::PayloadHashMismatch => EdgeError::PayloadHashMismatch,
+        CoreFailureCode::HubCursorExhausted => EdgeError::HubCursorExhausted,
+        CoreFailureCode::AckInvalid => EdgeError::AckInvalid,
     }
 }
 
@@ -1841,6 +1846,7 @@ mod tests {
     };
 
     use super::*;
+    use rusqlite::{params, Connection};
     use tempfile::tempdir;
 
     const NOW: i64 = 1_700_000_000_000;
@@ -1975,6 +1981,37 @@ mod tests {
         (directory, daemon, edge)
     }
 
+    fn edge_with_counter_at_max(column: &str) -> (tempfile::TempDir, LocalApiSimulator, HubEdge) {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("hub.sqlite");
+        drop(HubCore::open(&database, clipmesh_hub_core::RetentionLimits::default()).unwrap());
+        let connection = Connection::open(&database).unwrap();
+        let maximum = format!("{:020}", u64::MAX);
+        match column {
+            "cursor_high_water" => {
+                connection
+                    .execute(
+                        "UPDATE hub_meta SET cursor_high_water=?1 WHERE singleton=1",
+                        params![maximum],
+                    )
+                    .unwrap();
+            }
+            "clear_generation" => {
+                connection
+                    .execute(
+                        "UPDATE hub_meta SET clear_generation=?1 WHERE singleton=1",
+                        params![maximum],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!("test counter is closed"),
+        }
+        drop(connection);
+        let daemon = LocalApiSimulator::admitted();
+        let edge = HubEdge::prepare(config(), daemon.client(), database).unwrap();
+        (directory, daemon, edge)
+    }
+
     fn request() -> HttpRequest {
         HttpRequest {
             method: "GET".to_owned(),
@@ -2061,6 +2098,69 @@ mod tests {
         let frames = drain(edge, session);
         assert_eq!(frames.len(), 2);
         session
+    }
+
+    #[test]
+    fn counter_exhaustion_returns_terminal_codes_and_changes_readiness() {
+        let (_directory, _daemon, edge) = edge_with_counter_at_max("cursor_high_water");
+        let session = live(&edge);
+        let publish = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"00000000-0000-4000-8000-000000000041","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}"#;
+        assert!(matches!(
+            edge.handle_text(session, publish, NOW),
+            Err(EdgeFailure(EdgeError::HubCursorExhausted))
+        ));
+        assert_eq!(
+            edge.readiness(),
+            HttpResponse {
+                status: 503,
+                body: "{\"status\":\"not_ready\",\"reason_code\":\"hub_cursor_exhausted\"}"
+                    .to_owned(),
+            }
+        );
+        assert!(matches!(
+            edge.handle_text(session, publish, NOW),
+            Err(EdgeFailure(EdgeError::HubCursorExhausted))
+        ));
+        let connection = Connection::open(edge.core.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM clips", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+
+        let (_directory, _daemon, edge) = edge_with_counter_at_max("clear_generation");
+        let session = live(&edge);
+        let clear = format!(
+            r#"{{"protocol_version":1,"type":"clear_history","request_id":"00000000-0000-4000-8000-000000000042","expected_clear_generation":"{}"}}"#,
+            u64::MAX
+        );
+        assert!(matches!(
+            edge.handle_text(session, &clear, NOW),
+            Err(EdgeFailure(EdgeError::ClearGenerationExhausted))
+        ));
+        assert_eq!(
+            edge.readiness(),
+            HttpResponse {
+                status: 503,
+                body: "{\"status\":\"not_ready\",\"reason_code\":\"clear_generation_exhausted\"}"
+                    .to_owned(),
+            }
+        );
+        assert!(matches!(
+            edge.handle_text(session, &clear, NOW),
+            Err(EdgeFailure(EdgeError::ClearGenerationExhausted))
+        ));
+        let connection = Connection::open(edge.core.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM clear_receipts", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
