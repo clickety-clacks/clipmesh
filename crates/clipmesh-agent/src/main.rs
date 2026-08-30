@@ -6,8 +6,8 @@ use std::{
 };
 
 use clipmesh_agent::{
-    drive_server_once, establish_live, send_observation, AgentConfig, AgentError, Platform,
-    WebSocketTransport,
+    drive_server_once, establish_live, send_observation, send_shared_clear, AgentConfig,
+    AgentError, Platform, WebSocketTransport,
 };
 use clipmesh_agent_core::{
     AdapterError, AgentCore, AgentState, ClipboardAdapter, LocalObservation, PlatformRevision,
@@ -41,10 +41,14 @@ fn run() -> Result<(), AgentError> {
 trait Desktop: ClipboardAdapter {
     fn locked(&mut self) -> bool;
     fn observation(&mut self) -> Result<Option<LocalObservation>, AgentError>;
+    fn service_control(&mut self, core: &mut AgentCore) -> Result<bool, AgentError>;
 }
 
-fn run_desktop<D: Desktop>(config: AgentConfig, mut desktop: D) -> Result<(), AgentError> {
-    let mut core = AgentCore::open(&config.state_path)?;
+fn run_desktop<D: Desktop>(
+    config: AgentConfig,
+    mut core: AgentCore,
+    mut desktop: D,
+) -> Result<(), AgentError> {
     if desktop.locked() {
         core.set_locked(true);
     } else {
@@ -53,12 +57,19 @@ fn run_desktop<D: Desktop>(config: AgentConfig, mut desktop: D) -> Result<(), Ag
     let mut transport = None;
     let mut backoff = ReconnectBackoff::default();
     let mut last_revision: Option<PlatformRevision> = None;
+    let mut shared_clear_pending = false;
 
     loop {
         let now_ms = unix_ms()?;
+        shared_clear_pending |= desktop.service_control(&mut core)?;
         let locked = desktop.locked();
         core.set_locked(locked);
         if locked {
+            transport = None;
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if core.state() == AgentState::LocallyPaused {
             transport = None;
             thread::sleep(Duration::from_millis(200));
             continue;
@@ -81,6 +92,20 @@ fn run_desktop<D: Desktop>(config: AgentConfig, mut desktop: D) -> Result<(), Ag
                     ));
                     continue;
                 }
+            }
+        }
+        if shared_clear_pending {
+            if let Some(connection) = transport.as_mut() {
+                if send_shared_clear(&core, connection).is_err() {
+                    core.disconnect();
+                    backoff.disconnected(now_ms);
+                    transport = None;
+                    thread::sleep(Duration::from_millis(
+                        backoff.next_delay_ms(random_sample()),
+                    ));
+                    continue;
+                }
+                shared_clear_pending = false;
             }
         }
         if let Some(connection) = transport.as_mut() {
@@ -131,7 +156,10 @@ fn random_sample() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
-    use clipmesh_agent_linux::{LinuxSessionLockState, LockStateMonitor, WaylandClipboard};
+    use clipmesh_agent_linux::{
+        apply_control, ControlOutcome, LinuxAdapterError, LinuxSessionLockState, LockStateMonitor,
+        OwnerControlSocket, WaylandClipboard,
+    };
 
     if config.platform != Platform::LinuxWayland {
         return Err(AgentError::ConfigValueInvalid);
@@ -139,6 +167,7 @@ fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
     struct LinuxDesktop {
         clipboard: WaylandClipboard,
         lock: LockStateMonitor<LinuxSessionLockState>,
+        control: OwnerControlSocket,
     }
     impl ClipboardAdapter for LinuxDesktop {
         fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError> {
@@ -158,19 +187,54 @@ fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
                 .observe_text()
                 .map_err(|_| AgentError::AdapterUnavailable)
         }
+        fn service_control(&mut self, core: &mut AgentCore) -> Result<bool, AgentError> {
+            let accepted = match self.control.try_accept_command() {
+                Ok(accepted) => accepted,
+                Err(
+                    LinuxAdapterError::ControlRequestInvalid | LinuxAdapterError::StatePathInsecure,
+                ) => return Ok(false),
+                Err(LinuxAdapterError::LocalStateUnavailable) => {
+                    return Err(AgentError::LocalStateUnavailable)
+                }
+                Err(_) => return Err(AgentError::AdapterUnavailable),
+            };
+            let Some((stream, command)) = accepted else {
+                return Ok(false);
+            };
+            let outcome = apply_control(core, command)?;
+            let shared_clear = outcome == ControlOutcome::SharedClearRequested;
+            let _ = OwnerControlSocket::respond(stream, outcome);
+            Ok(shared_clear)
+        }
     }
+
+    let core = AgentCore::open(&config.state_path)?;
+    let control =
+        OwnerControlSocket::bind(&config.control_socket).map_err(|error| match error {
+            LinuxAdapterError::StatePathInsecure => AgentError::StatePathInsecure,
+            LinuxAdapterError::LocalStateUnavailable => AgentError::LocalStateUnavailable,
+            _ => AgentError::AdapterUnavailable,
+        })?;
+    control
+        .set_nonblocking(true)
+        .map_err(|_| AgentError::LocalStateUnavailable)?;
     run_desktop(
         config,
+        core,
         LinuxDesktop {
             clipboard: WaylandClipboard::connect().map_err(|_| AgentError::AdapterUnavailable)?,
             lock: LockStateMonitor::new(LinuxSessionLockState::for_current_process()),
+            control,
         },
     )
 }
 
 #[cfg(target_os = "macos")]
 fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
-    use clipmesh_agent_macos::{LockStateMonitor, MacPasteboard, MacSessionLockState};
+    use clipmesh_agent_macos::{
+        apply_control, ControlOutcome, LockStateMonitor, MacAdapterError, MacPasteboard,
+        MacSessionLockState, OwnerControlSocket,
+    };
 
     if config.platform != Platform::Macos {
         return Err(AgentError::ConfigValueInvalid);
@@ -178,6 +242,7 @@ fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
     struct MacDesktop {
         clipboard: MacPasteboard,
         lock: LockStateMonitor<MacSessionLockState>,
+        control: OwnerControlSocket,
     }
     impl ClipboardAdapter for MacDesktop {
         fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError> {
@@ -197,12 +262,44 @@ fn run_platform(config: AgentConfig) -> Result<(), AgentError> {
                 .observe_text()
                 .map_err(|_| AgentError::AdapterUnavailable)
         }
+        fn service_control(&mut self, core: &mut AgentCore) -> Result<bool, AgentError> {
+            let accepted = match self.control.try_accept_command() {
+                Ok(accepted) => accepted,
+                Err(
+                    MacAdapterError::ControlRequestInvalid | MacAdapterError::StatePathInsecure,
+                ) => return Ok(false),
+                Err(MacAdapterError::LocalStateUnavailable) => {
+                    return Err(AgentError::LocalStateUnavailable)
+                }
+                Err(_) => return Err(AgentError::AdapterUnavailable),
+            };
+            let Some((stream, command)) = accepted else {
+                return Ok(false);
+            };
+            let outcome = apply_control(core, command)?;
+            let shared_clear = outcome == ControlOutcome::SharedClearRequested;
+            let _ = OwnerControlSocket::respond(stream, outcome);
+            Ok(shared_clear)
+        }
     }
+
+    let core = AgentCore::open(&config.state_path)?;
+    let control =
+        OwnerControlSocket::bind(&config.control_socket).map_err(|error| match error {
+            MacAdapterError::StatePathInsecure => AgentError::StatePathInsecure,
+            MacAdapterError::LocalStateUnavailable => AgentError::LocalStateUnavailable,
+            _ => AgentError::AdapterUnavailable,
+        })?;
+    control
+        .set_nonblocking(true)
+        .map_err(|_| AgentError::LocalStateUnavailable)?;
     run_desktop(
         config,
+        core,
         MacDesktop {
             clipboard: MacPasteboard::general().map_err(|_| AgentError::AdapterUnavailable)?,
             lock: LockStateMonitor::new(MacSessionLockState),
+            control,
         },
     )
 }

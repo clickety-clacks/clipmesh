@@ -13,6 +13,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use clipmesh_agent_core::{
@@ -211,9 +212,38 @@ impl OwnerControlSocket {
     }
 
     pub fn accept_command(&self) -> Result<(UnixStream, ControlCommand), LinuxAdapterError> {
-        let (mut stream, _) = self
+        let (stream, _) = self
             .listener
             .accept()
+            .map_err(|_| LinuxAdapterError::LocalStateUnavailable)?;
+        self.admit_command(stream)
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<(), LinuxAdapterError> {
+        self.listener
+            .set_nonblocking(nonblocking)
+            .map_err(|_| LinuxAdapterError::LocalStateUnavailable)
+    }
+
+    pub fn try_accept_command(
+        &self,
+    ) -> Result<Option<(UnixStream, ControlCommand)>, LinuxAdapterError> {
+        match self.listener.accept() {
+            Ok((stream, _)) => self.admit_command(stream).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(_) => Err(LinuxAdapterError::LocalStateUnavailable),
+        }
+    }
+
+    fn admit_command(
+        &self,
+        mut stream: UnixStream,
+    ) -> Result<(UnixStream, ControlCommand), LinuxAdapterError> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|_| LinuxAdapterError::LocalStateUnavailable)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
             .map_err(|_| LinuxAdapterError::LocalStateUnavailable)?;
         if peer_uid(&stream)? != self.owner_uid {
             return Err(LinuxAdapterError::StatePathInsecure);
@@ -1137,6 +1167,8 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = directory.path().join("control.sock");
         let server = OwnerControlSocket::bind(&path).unwrap();
+        server.set_nonblocking(true).unwrap();
+        assert!(server.try_accept_command().unwrap().is_none());
         let client_path = path.clone();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(client_path).unwrap();
@@ -1146,7 +1178,12 @@ mod tests {
             stream.read_to_string(&mut response).unwrap();
             response
         });
-        let (stream, command) = server.accept_command().unwrap();
+        let (stream, command) = loop {
+            if let Some(accepted) = server.try_accept_command().unwrap() {
+                break accepted;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        };
         assert_eq!(command, ControlCommand::SharedClear);
         OwnerControlSocket::respond(stream, ControlOutcome::SharedClearRequested).unwrap();
         assert_eq!(client.join().unwrap(), "shared-clear-requested\n");

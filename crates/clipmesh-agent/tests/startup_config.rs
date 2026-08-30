@@ -1,4 +1,4 @@
-use std::{fs, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
 use tempfile::TempDir;
 
@@ -138,4 +138,66 @@ fn startup_rejects_complete_config_mutation_matrix_before_network() {
             "{name} opened local control before rejection"
         );
     }
+}
+
+#[test]
+fn startup_rejects_insecure_state_before_platform_adapter() {
+    let fixture = TempDir::new().unwrap();
+    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let state = fixture.path().join("state.sqlite3");
+    let control = fixture.path().join("control.sock");
+    let config = fixture.path().join("insecure-state.toml");
+    fs::write(
+        &config,
+        format!(
+            "config_version = 1\nhub_url = 'ws://100.64.0.7:4357/v1/stream'\nplatform = 'linux-wayland'\nstate_path = '{}'\ncontrol_socket = '{}'\n",
+            state.display(),
+            control.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_clipmesh-agent"))
+        .args(["--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "state_path_insecure"
+    );
+    assert!(!state.exists());
+    assert!(!control.exists());
+}
+
+#[test]
+fn startup_opens_secure_state_and_control_before_platform_adapter() {
+    let fixture = TempDir::new().unwrap();
+    fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let state = fixture.path().join("state.sqlite3");
+    let control = fixture.path().join("control.sock");
+    let config = fixture.path().join("secure-state.toml");
+    fs::write(
+        &config,
+        format!(
+            "config_version = 1\nhub_url = 'ws://100.64.0.7:4357/v1/stream'\nplatform = 'linux-wayland'\nstate_path = '{}'\ncontrol_socket = '{}'\n",
+            state.display(),
+            control.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_clipmesh-agent"))
+        .args(["--config", config.to_str().unwrap()])
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        "adapter_unavailable"
+    );
+    assert!(state.exists());
+    assert!(!control.exists(), "control socket must be removed at exit");
 }

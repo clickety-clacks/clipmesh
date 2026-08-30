@@ -169,6 +169,8 @@ pub enum AgentError {
     ProtocolSchemaInvalid,
     #[error("protocol_version_unsupported")]
     ProtocolVersionUnsupported,
+    #[error("state_path_insecure")]
+    StatePathInsecure,
     #[error("local_state_unavailable")]
     LocalStateUnavailable,
     #[error("adapter_unavailable")]
@@ -184,9 +186,8 @@ pub enum AgentError {
 impl From<CoreError> for AgentError {
     fn from(error: CoreError) -> Self {
         match error {
-            CoreError::StatePathInsecure | CoreError::LocalStateUnavailable => {
-                Self::LocalStateUnavailable
-            }
+            CoreError::StatePathInsecure => Self::StatePathInsecure,
+            CoreError::LocalStateUnavailable => Self::LocalStateUnavailable,
             CoreError::AdapterUnavailable => Self::AdapterUnavailable,
             _ => Self::ProtocolSchemaInvalid,
         }
@@ -383,6 +384,21 @@ pub fn send_observation<T: Transport, A: ClipboardAdapter>(
     Ok(())
 }
 
+pub fn send_shared_clear<T: Transport>(
+    core: &AgentCore,
+    transport: &mut T,
+) -> Result<(), AgentError> {
+    let expected_clear_generation = core
+        .snapshot()?
+        .clear_generation
+        .ok_or(AgentError::ProtocolSchemaInvalid)?;
+    transport.send(ClientMessageV1::ClearHistory {
+        protocol_version: ProtocolVersion,
+        request_id: uuid_v4(uuid::Uuid::new_v4())?,
+        expected_clear_generation: decimal(expected_clear_generation)?,
+    })
+}
+
 pub fn drive_server_once<T: Transport, A: ClipboardAdapter>(
     core: &mut AgentCore,
     adapter: &mut A,
@@ -426,6 +442,8 @@ pub fn drive_server_once<T: Transport, A: ClipboardAdapter>(
                     cleared_through_cursor.map(U64Decimal::get),
                 )?;
             }
+            ServerMessageV1::ClearAccepted { .. } => {}
+            ServerMessageV1::ClearRejected { .. } => return Err(AgentError::RemoteFailure),
             ServerMessageV1::Error { .. } => return Err(AgentError::RemoteFailure),
             _ => return Err(AgentError::ProtocolSchemaInvalid),
         }
@@ -682,6 +700,33 @@ mod tests {
         assert!(!serialized.contains("identity"));
         assert!(!serialized.contains("credential"));
         assert!(!serialized.contains("account"));
+
+        send_shared_clear(&core, &mut transport).unwrap();
+        let ClientMessageV1::ClearHistory {
+            request_id,
+            expected_clear_generation,
+            ..
+        } = &transport.sent[1]
+        else {
+            panic!("owner shared clear emitted the wrong protocol message");
+        };
+        assert_eq!(expected_clear_generation.get(), 1);
+        transport
+            .received
+            .push_back(ServerMessageV1::ClearAccepted {
+                protocol_version: ProtocolVersion,
+                request_id: request_id.clone(),
+                clear_generation: decimal(2).unwrap(),
+                cleared_through_cursor: None,
+                duplicate: false,
+            });
+        drive_server_once(
+            &mut core,
+            &mut FakeClipboard,
+            &mut transport,
+            1_700_000_000_001,
+        )
+        .unwrap();
     }
 
     struct FakeTransport {
