@@ -11,8 +11,8 @@ if rg -n "$forbidden" "$agent_root"; then
   exit 1
 fi
 
-if rg -n 'clipmesh-protocol' "$agent_root/Cargo.toml"; then
-  echo "desktop domain depends on immutable superseded D0 types" >&2
+if ! rg -q 'clipmesh-protocol' "$agent_root/Cargo.toml"; then
+  echo "desktop domain is not using the canonical shared protocol content seam" >&2
   exit 1
 fi
 

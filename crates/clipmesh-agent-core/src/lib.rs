@@ -7,7 +7,7 @@ mod store;
 
 use std::{fmt, path::Path};
 
-pub use clipmesh_hub_core::{ClipContentV1, WireContentV1};
+pub use clipmesh_protocol::{ClipContentV1, WireContentV1};
 use store::StateStore;
 use thiserror::Error;
 use uuid::Uuid;
@@ -773,18 +773,16 @@ impl AgentCore {
     }
 }
 
-fn map_content_error(error: clipmesh_hub_core::CoreError) -> CoreError {
-    use clipmesh_hub_core::FailureCode;
+fn map_content_error(error: clipmesh_protocol::ContentError) -> CoreError {
+    use clipmesh_protocol::ContentError;
 
     match error {
-        clipmesh_hub_core::CoreError::Failure(code) => match code {
-            FailureCode::ContentTypeUnsupported => CoreError::ContentTypeUnsupported,
-            FailureCode::PayloadEncodingInvalid => CoreError::PayloadEncodingInvalid,
-            FailureCode::PayloadEmpty => CoreError::PayloadEmpty,
-            FailureCode::PayloadTooLarge => CoreError::PayloadTooLarge,
-            FailureCode::PayloadLengthMismatch => CoreError::PayloadLengthMismatch,
-            FailureCode::PayloadHashMismatch => CoreError::PayloadHashMismatch,
-            _ => CoreError::InvalidEvent,
-        },
+        ContentError::ContentTypeUnsupported => CoreError::ContentTypeUnsupported,
+        ContentError::PayloadEncodingInvalid => CoreError::PayloadEncodingInvalid,
+        ContentError::PayloadEmpty => CoreError::PayloadEmpty,
+        ContentError::PayloadTooLarge => CoreError::PayloadTooLarge,
+        ContentError::PayloadLengthMismatch => CoreError::PayloadLengthMismatch,
+        ContentError::PayloadHashMismatch => CoreError::PayloadHashMismatch,
+        ContentError::StorageIntegrity => CoreError::LocalStateUnavailable,
     }
 }

@@ -241,7 +241,7 @@ name = "clipmesh-agent-core"
 version = "0.1.0"
 dependencies = [
  "base64",
- "clipmesh-hub-core",
+ "clipmesh-protocol",
  "libc",
  "rusqlite",
  "sha2",
@@ -288,9 +288,8 @@ dependencies = [
 name = "clipmesh-hub-core"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "clipmesh-protocol",
  "rusqlite",
- "sha2",
  "tempfile",
  "thiserror",
  "uuid",

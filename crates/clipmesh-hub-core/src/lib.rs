@@ -10,9 +10,8 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+pub use clipmesh_protocol::{ClipContentV1, ContentError, WireContentV1};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -104,146 +103,6 @@ impl fmt::Display for StablePeerId {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub struct ClipContentV1(Vec<u8>);
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct WireContentV1 {
-    pub content_type: &'static str,
-    pub payload_b64: String,
-    pub payload_bytes: usize,
-    pub content_sha256: String,
-}
-
-impl fmt::Debug for WireContentV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("WireContentV1([redacted])")
-    }
-}
-
-impl ClipContentV1 {
-    pub fn from_wire(
-        content_type: &str,
-        payload_b64: &str,
-        payload_bytes: usize,
-        content_sha256: &str,
-        max_payload_bytes: usize,
-    ) -> Result<Self, CoreError> {
-        if content_type != "text/plain" {
-            return Err(CoreError::Failure(FailureCode::ContentTypeUnsupported));
-        }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(payload_b64)
-            .map_err(|_| CoreError::Failure(FailureCode::PayloadEncodingInvalid))?;
-        Self::validate(
-            bytes,
-            max_payload_bytes,
-            Some((payload_bytes, content_sha256)),
-        )
-    }
-
-    pub fn from_platform(bytes: &[u8], max_payload_bytes: usize) -> Result<Self, CoreError> {
-        Self::validate(bytes.to_vec(), max_payload_bytes, None)
-    }
-
-    pub fn from_storage_blob(bytes: &[u8]) -> Result<Self, CoreError> {
-        Self::validate(bytes.to_vec(), HARD_MAX_PAYLOAD_BYTES, None)
-            .map_err(|_| CoreError::Failure(FailureCode::DatabaseIntegrityFailed))
-    }
-
-    fn validate(
-        bytes: Vec<u8>,
-        max_payload_bytes: usize,
-        wire_metadata: Option<(usize, &str)>,
-    ) -> Result<Self, CoreError> {
-        if bytes.is_empty() {
-            return Err(CoreError::Failure(FailureCode::PayloadEmpty));
-        }
-        if std::str::from_utf8(&bytes).is_err() {
-            return Err(CoreError::Failure(FailureCode::PayloadEncodingInvalid));
-        }
-        if bytes.len() > max_payload_bytes {
-            return Err(CoreError::Failure(FailureCode::PayloadTooLarge));
-        }
-        if let Some((declared_length, declared_hash)) = wire_metadata {
-            if declared_length != bytes.len() {
-                return Err(CoreError::Failure(FailureCode::PayloadLengthMismatch));
-            }
-            if declared_hash != sha256_hex(&bytes) {
-                return Err(CoreError::Failure(FailureCode::PayloadHashMismatch));
-            }
-        }
-        Ok(Self(bytes))
-    }
-
-    pub fn as_storage_blob(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn to_wire(&self) -> WireContentV1 {
-        WireContentV1 {
-            content_type: "text/plain",
-            payload_b64: URL_SAFE_NO_PAD.encode(&self.0),
-            payload_bytes: self.0.len(),
-            content_sha256: sha256_hex(&self.0),
-        }
-    }
-
-    pub fn to_platform(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn same_content(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-
-    pub fn to_preview(&self, scalar_limit: usize) -> String {
-        let text = std::str::from_utf8(&self.0).expect("ClipContentV1 is valid UTF-8");
-        let mut preview = String::new();
-        let mut whitespace = false;
-        for character in text.chars() {
-            let character = if character.is_control()
-                && character != '\t'
-                && character != '\r'
-                && character != '\n'
-            {
-                '\u{fffd}'
-            } else {
-                character
-            };
-            if character.is_whitespace() {
-                if whitespace {
-                    continue;
-                }
-                whitespace = true;
-                if preview.chars().count() == scalar_limit {
-                    break;
-                }
-                preview.push(' ');
-            } else {
-                whitespace = false;
-                if preview.chars().count() == scalar_limit {
-                    break;
-                }
-                preview.push(character);
-            }
-        }
-        preview
-    }
-}
-
-impl fmt::Debug for ClipContentV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ClipContentV1([redacted])")
-    }
-}
-
-impl fmt::Display for ClipContentV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("[redacted]")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailureCode {
     ConfigValueInvalid,
@@ -277,6 +136,21 @@ pub enum FailureCode {
 pub enum CoreError {
     #[error("hub operation failed: {0:?}")]
     Failure(FailureCode),
+}
+
+impl From<ContentError> for CoreError {
+    fn from(error: ContentError) -> Self {
+        let code = match error {
+            ContentError::ContentTypeUnsupported => FailureCode::ContentTypeUnsupported,
+            ContentError::PayloadEncodingInvalid => FailureCode::PayloadEncodingInvalid,
+            ContentError::PayloadEmpty => FailureCode::PayloadEmpty,
+            ContentError::PayloadTooLarge => FailureCode::PayloadTooLarge,
+            ContentError::PayloadLengthMismatch => FailureCode::PayloadLengthMismatch,
+            ContentError::PayloadHashMismatch => FailureCode::PayloadHashMismatch,
+            ContentError::StorageIntegrity => FailureCode::DatabaseIntegrityFailed,
+        };
+        Self::Failure(code)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1417,13 +1291,6 @@ fn nonzero(value: u64) -> Option<u64> {
 fn retention_ms(seconds: u64) -> Result<i64, CoreError> {
     i64::try_from(seconds.saturating_mul(1000))
         .map_err(|_| CoreError::Failure(FailureCode::ConfigValueInvalid))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 fn storage_error(_: rusqlite::Error) -> CoreError {

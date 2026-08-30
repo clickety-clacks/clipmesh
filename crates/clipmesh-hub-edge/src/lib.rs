@@ -1283,7 +1283,7 @@ impl HubEdge {
             &event.content_sha256,
             self.config.max_payload_bytes,
         )
-        .map_err(|error| EdgeFailure(core_error(error)))?;
+        .map_err(|error| EdgeFailure(core_error(error.into())))?;
         self.core
             .publish(
                 session_id,

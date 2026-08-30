@@ -9,7 +9,7 @@ obsolete='HistoryMode|AdministratorCredential|DeviceCredential|EnrollmentArtifac
 current_files=()
 while IFS= read -r -d '' path; do
   case "$path" in
-    docs/* | crates/clipmesh-protocol/* | scripts/check-*.sh | scripts/test-*.sh)
+    docs/* | scripts/check-*.sh | scripts/test-*.sh)
       ;;
     *.rs | *.toml | *.sql | *.yaml | *.yml | *.json | *.service | *.plist | *.sh)
       current_files+=("$repo_root/$path")
@@ -22,8 +22,7 @@ if ((${#current_files[@]} == 0)); then
   exit 1
 fi
 
-# The accepted R1 card keeps the exact D0 protocol crate byte-identical. Scan
-# every other tracked executable, schema, configuration, route, and deployment
+# Scan every tracked executable, schema, configuration, route, and deployment
 # surface in the current tree. Documentation and the census scripts may name
 # removed concepts only to specify or detect them.
 if rg -n "$obsolete" "${current_files[@]}"; then
@@ -31,8 +30,8 @@ if rg -n "$obsolete" "${current_files[@]}"; then
   exit 1
 fi
 
-if rg -n 'clipmesh-protocol' "$hub_root/Cargo.toml"; then
-  echo "hub core still depends on superseded D0 application-authority types" >&2
+if ! rg -q 'clipmesh-protocol' "$hub_root/Cargo.toml"; then
+  echo "hub core is not using the canonical shared protocol content seam" >&2
   exit 1
 fi
 

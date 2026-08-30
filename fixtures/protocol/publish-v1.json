@@ -3,10 +3,8 @@
   "type": "publish",
   "event": {
     "message_id": "00000000-0000-4000-8000-000000000001",
-    "source_device_id": "00000000-0000-4000-8000-000000000002",
-    "source_seq": "1",
+    "clear_generation": "1",
     "created_at_ms": 1700000000000,
-    "expires_at_ms": 1700014400000,
     "content_type": "text/plain",
     "payload_bytes": 12,
     "content_sha256": "5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b",

@@ -21,6 +21,15 @@ if "$tmp_root/scripts/check-r1-hub-policy-boundary.sh" >/dev/null 2>&1; then
   exit 1
 fi
 
+rm "$tmp_root/crates/seeded-current-scope/src/lib.rs"
+git -C "$tmp_root" add -u
+printf '\npub struct AdministratorCredential;\n' >> "$tmp_root/crates/clipmesh-protocol/src/lib.rs"
+git -C "$tmp_root" add crates/clipmesh-protocol/src/lib.rs
+if "$tmp_root/scripts/check-r1-hub-policy-boundary.sh" >/dev/null 2>&1; then
+  echo "seeded obsolete surface in the shared protocol crate passed the current-tree census" >&2
+  exit 1
+fi
+
 history_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root" "$history_root"' EXIT
 (cd "$repo_root" && git ls-files -z | tar --null --files-from=- -cf -) | tar -xf - -C "$history_root"
