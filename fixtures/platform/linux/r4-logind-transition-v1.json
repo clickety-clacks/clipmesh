@@ -1,0 +1,14 @@
+{
+  "compositor_protocol": "wlr-data-control-v1",
+  "locked_acts_locked": true,
+  "platform": "linux-wayland",
+  "provider": "systemd-logind",
+  "schema_version": 1,
+  "session_kind": "isolated_private_bus",
+  "states": [
+    "Unlocked",
+    "Locked",
+    "Unlocked"
+  ],
+  "unlocked_acts_locked": false
+}

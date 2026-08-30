@@ -30,7 +30,14 @@ jq -eS '
      ((.lock_state == "Locked" or .lock_state == "Unlocked" or .lock_state == "Unknown") | not) or
      (.lock_state == "Unknown" and .lock_state_acts_locked != true) or
      (.local_mime_types | type) != "array" or
-     any(.local_mime_types[]; type != "string")
+     (.local_mime_types | sort) != [
+       "STRING",
+       "TEXT",
+       "UTF8_STRING",
+       "application/x-clipmesh-unverified",
+       "text/plain",
+       "text/plain;charset=utf-8"
+     ]
   then error("capture_value_unrecognized") else . end |
-  .local_mime_types |= sort
+  del(.local_mime_types)
 '

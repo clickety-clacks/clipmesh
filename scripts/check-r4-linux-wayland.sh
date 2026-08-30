@@ -15,9 +15,21 @@ fi
 
 cargo test -p clipmesh-agent-core --test desktop_domain
 cargo test -p clipmesh-agent-linux --all-targets
+cargo build -p clipmesh-agent-linux --example capture_logind_transition
+if target/debug/examples/capture_logind_transition >/dev/null 2>&1; then
+  echo 'R4 logind capture ran outside its isolated namespace' >&2
+  exit 1
+fi
 
 capture="$(cargo run --quiet -p clipmesh-agent-linux --example capture_wayland_adapter)"
-scripts/sanitize-r4-wayland-fixture.sh <<<"$capture" >/dev/null
+sanitized_capture="$(scripts/sanitize-r4-wayland-fixture.sh <<<"$capture")"
+diff -u fixtures/platform/linux/r4-wayland-adapter-v1.json \
+  <(printf '%s\n' "$sanitized_capture")
+if jq '.local_mime_types += ["application/x-private-source-alpha"]' <<<"$capture" |
+  scripts/sanitize-r4-wayland-fixture.sh >/dev/null 2>&1; then
+  echo 'R4 sanitizer accepted an unrecognized MIME value' >&2
+  exit 1
+fi
 jq -e '
   .schema_version == 1 and
   .compositor_protocol == "wlr-data-control-v1" and
@@ -33,6 +45,13 @@ jq -e '
   (.lock_state == "Locked" or .lock_state == "Unlocked" or .lock_state == "Unknown") and
   (.lock_state != "Unknown" or .lock_state_acts_locked == true)
 ' <<<"$capture" >/dev/null
+
+lock_capture="$(scripts/capture-r4-logind-transition.sh)"
+sanitized_lock_capture="$(
+  scripts/sanitize-r4-logind-transition-fixture.sh <<<"$lock_capture"
+)"
+diff -u fixtures/platform/linux/r4-logind-transition-v1.json \
+  <(printf '%s\n' "$sanitized_lock_capture")
 
 rendered_unit="$(mktemp --suffix=.service)"
 trap 'rm -f "$rendered_unit"' EXIT
