@@ -13,6 +13,7 @@ Restart=no
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+ReadWritePaths=@@CLIPMESH_AGENT_STATE_DIRECTORY@@ @@CLIPMESH_AGENT_CONTROL_DIRECTORY@@
 
 [Install]
 WantedBy=default.target

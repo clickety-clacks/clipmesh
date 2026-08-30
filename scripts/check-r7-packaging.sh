@@ -58,6 +58,13 @@ if scripts/render-r7-packaging.py "$scratch/unknown" <"$scratch/unknown-values.j
   exit 1
 fi
 
+jq '.CLIPMESH_STATE_PATH = "/agent.sqlite3"' \
+  "$scratch/render-values.json" >"$scratch/root-parent-values.json"
+if scripts/render-r7-packaging.py "$scratch/root-parent" <"$scratch/root-parent-values.json"; then
+  printf 'R7 renderer accepted a root state parent\n' >&2
+  exit 1
+fi
+
 mkdir "$scratch/existing"
 if scripts/render-r7-packaging.py "$scratch/existing" <"$scratch/render-values.json"; then
   printf 'R7 renderer overwrote an existing directory\n' >&2
@@ -114,6 +121,14 @@ with (root / "com.example.clipmesh-agent.plist").open("rb") as handle:
 assert launchd["RunAtLoad"] is False
 assert launchd["KeepAlive"] is False
 assert launchd["ProgramArguments"][0].endswith("/bin/clipmesh-agent")
+
+hub_service = (root / "clipmesh-hub.service").read_text(encoding="utf-8")
+agent_service = (root / "clipmesh-agent.service").read_text(encoding="utf-8")
+assert "ProtectSystem=strict\nReadWritePaths=/opt/clipmesh/state/hub\n" in hub_service
+assert (
+    "ProtectSystem=strict\n"
+    "ReadWritePaths=/opt/clipmesh/state /opt/clipmesh/state\n"
+) in agent_service
 PY
 
 if command -v systemd-analyze >/dev/null 2>&1; then

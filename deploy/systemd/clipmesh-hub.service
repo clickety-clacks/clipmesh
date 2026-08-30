@@ -13,6 +13,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
+ReadWritePaths=@@CLIPMESH_HUB_STATE_DIRECTORY@@
 
 [Install]
 WantedBy=multi-user.target

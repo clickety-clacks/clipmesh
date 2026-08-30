@@ -23,6 +23,10 @@ ASSETS = (
         0o644,
     ),
 )
+DERIVED_PATH_TOKENS = {
+    "CLIPMESH_AGENT_STATE_DIRECTORY": "CLIPMESH_STATE_PATH",
+    "CLIPMESH_AGENT_CONTROL_DIRECTORY": "CLIPMESH_CONTROL_SOCKET",
+}
 
 
 def fail(message: str) -> NoReturn:
@@ -67,12 +71,18 @@ def main() -> None:
         sources.append((source, output_name, mode, text))
 
     values = load_values()
-    missing = sorted(required - values.keys())
-    unknown = sorted(values.keys() - required)
+    external_required = required - DERIVED_PATH_TOKENS.keys()
+    missing = sorted(external_required - values.keys())
+    unknown = sorted(values.keys() - external_required)
     if missing:
         fail(f"missing variables: {','.join(missing)}")
     if unknown:
         fail(f"unknown variables: {','.join(unknown)}")
+    for target, source in DERIVED_PATH_TOKENS.items():
+        path = Path(values[source])
+        if not path.is_absolute() or path.parent == Path("/"):
+            fail(f"{source} must have an absolute non-root parent")
+        values[target] = str(path.parent)
 
     output_directory = Path(sys.argv[1])
     old_umask = os.umask(0o077)
