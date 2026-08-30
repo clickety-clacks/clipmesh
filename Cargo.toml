@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/clipmesh-agent",
     "crates/clipmesh-agent-core",
     "crates/clipmesh-agent-linux",
     "crates/clipmesh-agent-macos",

@@ -1,9 +1,9 @@
 //! Tailnet-only HTTP and WebSocket edge for the transport-neutral hub core.
 //!
-//! This crate deliberately has no executable and never starts a listener by
-//! itself. A deployment-owned process may explicitly create the dormant
-//! listener through [`HubEdge::bind`]. That listener owns both accepted socket
-//! addresses and obtains WhoIs before it reads one HTTP byte.
+//! The library never starts a listener by itself. The `clipmesh-hub` executable
+//! is the explicit deployment boundary that loads a closed configuration and
+//! calls [`HubEdge::bind`]. That listener owns both accepted socket addresses
+//! and obtains WhoIs before it reads one HTTP byte.
 
 use std::{
     collections::HashMap,

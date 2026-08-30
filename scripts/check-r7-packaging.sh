@@ -8,16 +8,19 @@ scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 
 render_values() {
-  python3 - <<'PY'
+  python3 - "$1" <<'PY'
 import json
+from pathlib import Path
+import sys
+scratch = Path(sys.argv[1])
 print(json.dumps({
-    "CLIPMESH_HUB_BINARY": "/usr/bin/true",
+    "CLIPMESH_HUB_BINARY": str(scratch / "bin" / "clipmesh-hub"),
     "CLIPMESH_HUB_CONFIG_PATH": "/opt/clipmesh/config/hub.toml",
     "CLIPMESH_HUB_LISTEN_ADDRESS": "192.0.2.1:4357",
     "CLIPMESH_HUB_STATE_DIRECTORY": "/opt/clipmesh/state/hub",
     "CLIPMESH_SERVICE_USER": "root",
     "CLIPMESH_SERVICE_GROUP": "root",
-    "CLIPMESH_AGENT_BINARY": "/usr/bin/true",
+    "CLIPMESH_AGENT_BINARY": str(scratch / "bin" / "clipmesh-agent"),
     "CLIPMESH_CONFIG_PATH": "/opt/clipmesh/config/agent.toml",
     "CLIPMESH_HUB_URL": "ws://192.0.2.1:4357/v1/stream",
     "CLIPMESH_AGENT_PLATFORM": "reserved-example",
@@ -36,7 +39,10 @@ print(json.dumps({
 PY
 }
 
-render_values >"$scratch/render-values.json"
+mkdir "$scratch/bin"
+install -m 0755 /usr/bin/true "$scratch/bin/clipmesh-hub"
+install -m 0755 /usr/bin/true "$scratch/bin/clipmesh-agent"
+render_values "$scratch" >"$scratch/render-values.json"
 scripts/render-r7-packaging.py "$scratch/direct" <"$scratch/render-values.json"
 
 jq 'del(.CLIPMESH_HUB_URL)' "$scratch/render-values.json" >"$scratch/missing-values.json"
@@ -107,7 +113,7 @@ with (root / "com.example.clipmesh-agent.plist").open("rb") as handle:
     launchd = plistlib.load(handle)
 assert launchd["RunAtLoad"] is False
 assert launchd["KeepAlive"] is False
-assert launchd["ProgramArguments"][0] == "/usr/bin/true"
+assert launchd["ProgramArguments"][0].endswith("/bin/clipmesh-agent")
 PY
 
 if command -v systemd-analyze >/dev/null 2>&1; then
@@ -166,10 +172,25 @@ jq -e '
     select(.version != "0.1.0")] | length == 0
 ' "$scratch/cargo-metadata.json" >/dev/null
 
+jq -e '
+  any(.packages[] | select(.name == "clipmesh-hub-edge") | .targets[];
+    .name == "clipmesh-hub" and any(.kind[]; . == "bin")) and
+  any(.packages[] | select(.name == "clipmesh-agent") | .targets[];
+    .name == "clipmesh-agent" and any(.kind[]; . == "bin"))
+' "$scratch/cargo-metadata.json" >/dev/null
+
+if cargo run --quiet -p clipmesh-agent -- --config \
+  "$scratch/direct/clipmesh-agent.toml" 2>"$scratch/agent-invalid.err"; then
+  printf 'R7 agent accepted a reserved-example endpoint or platform\n' >&2
+  exit 1
+fi
+test "$(cat "$scratch/agent-invalid.err")" = "config_value_invalid"
+
 cargo package --workspace --locked --allow-dirty --no-verify >/dev/null
 find target/package -maxdepth 1 -type f -name 'clipmesh-*-0.1.0.crate' \
   -printf '%f\n' | sort >"$scratch/actual-packages"
 printf '%s\n' \
+  clipmesh-agent-0.1.0.crate \
   clipmesh-agent-core-0.1.0.crate \
   clipmesh-agent-linux-0.1.0.crate \
   clipmesh-agent-macos-0.1.0.crate \
@@ -178,4 +199,4 @@ printf '%s\n' \
   clipmesh-protocol-0.1.0.crate | sort >"$scratch/expected-packages"
 diff -u "$scratch/expected-packages" "$scratch/actual-packages"
 
-printf 'R7 packaging check passed: 5 inactive renders, 6 version-0.1.0 crates\n'
+printf 'R7 packaging check passed: 5 inactive renders, 7 version-0.1.0 crates, 2 executable targets\n'

@@ -17,15 +17,18 @@ its canonical reviewed specification reference.
 ## Status
 
 The immutable Rust protocol foundation, the remediated transport-neutral hub
-policy core, the persistent desktop domain core, and a dormant Tailnet edge are
-present. The desktop core provides outbox, resume, clear-generation,
-local-control, revision-marker, and synthetic adapter seams without opening a
-network or platform listener. The edge validates a
+policy core, the persistent desktop domain core, and the explicit Tailnet hub
+and desktop agent executables are present. The desktop core provides outbox,
+resume, clear-generation, local-control, revision-marker, and synthetic
+adapter seams without opening a network or platform listener. The edge validates a
 configured Tailnet self address through LocalAPI, resolves each accepted
 socket with WhoIs before HTTP parsing, and holds the hub event lease through
-complete WebSocket-frame output. It has no executable or default listener.
-The hub core provides SQLite-only ordering, retry, resume, acknowledgement,
-retention, shared clear, and canonical clip-content custody.
+complete WebSocket-frame output. The `clipmesh-hub` binary is its only explicit
+bind-and-serve boundary. The `clipmesh-agent` binary admits a numeric Tailnet
+endpoint before transport, composes the native platform adapter, resumes to
+live, and reconnects with full jitter. The hub core provides SQLite-only
+ordering, retry, resume, acknowledgement, retention, shared clear, and
+canonical clip-content custody.
 
 The Linux Wayland and macOS native clipboard and lock-state adapters,
 owner-only Unix control seams, inactive generic systemd and launchd templates,
