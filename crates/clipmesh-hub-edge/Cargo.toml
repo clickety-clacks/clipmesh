@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
-clipmesh-hub-core = { path = "../clipmesh-hub-core" }
+clipmesh-hub-core = { path = "../clipmesh-hub-core", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

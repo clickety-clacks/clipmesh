@@ -1,0 +1,18 @@
+[Unit]
+Description=ClipMesh hub
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=@@CLIPMESH_SERVICE_USER@@
+Group=@@CLIPMESH_SERVICE_GROUP@@
+ExecStart=@@CLIPMESH_HUB_BINARY@@ --config @@CLIPMESH_HUB_CONFIG_PATH@@
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

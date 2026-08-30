@@ -1,0 +1,57 @@
+---
+- name: Require every topology and local-path render value
+  ansible.builtin.assert:
+    that:
+      - item is string
+      - item | length > 0
+    quiet: true
+  loop:
+    - "{{ clipmesh_render_output_directory }}"
+    - "{{ clipmesh_hub_binary }}"
+    - "{{ clipmesh_hub_config_path }}"
+    - "{{ clipmesh_hub_listen_address }}"
+    - "{{ clipmesh_hub_state_directory }}"
+    - "{{ clipmesh_service_user }}"
+    - "{{ clipmesh_service_group }}"
+    - "{{ clipmesh_agent_binary }}"
+    - "{{ clipmesh_agent_config_path }}"
+    - "{{ clipmesh_agent_hub_url }}"
+    - "{{ clipmesh_agent_platform }}"
+    - "{{ clipmesh_agent_state_path }}"
+    - "{{ clipmesh_agent_control_socket }}"
+  no_log: true
+
+- name: Render the closed inactive asset set
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ playbook_dir }}/../../scripts/render-r7-packaging.py"
+      - "{{ clipmesh_render_output_directory }}"
+    stdin: >-
+      {{
+        {
+          'CLIPMESH_HUB_BINARY': clipmesh_hub_binary,
+          'CLIPMESH_HUB_CONFIG_PATH': clipmesh_hub_config_path,
+          'CLIPMESH_HUB_LISTEN_ADDRESS': clipmesh_hub_listen_address,
+          'CLIPMESH_HUB_STATE_DIRECTORY': clipmesh_hub_state_directory,
+          'CLIPMESH_SERVICE_USER': clipmesh_service_user,
+          'CLIPMESH_SERVICE_GROUP': clipmesh_service_group,
+          'CLIPMESH_AGENT_BINARY': clipmesh_agent_binary,
+          'CLIPMESH_CONFIG_PATH': clipmesh_agent_config_path,
+          'CLIPMESH_HUB_URL': clipmesh_agent_hub_url,
+          'CLIPMESH_AGENT_PLATFORM': clipmesh_agent_platform,
+          'CLIPMESH_STATE_PATH': clipmesh_agent_state_path,
+          'CLIPMESH_CONTROL_SOCKET': clipmesh_agent_control_socket,
+          'CLIPMESH_RETENTION_SECONDS': clipmesh_retention_seconds,
+          'CLIPMESH_HISTORY_MAX_ENTRIES': clipmesh_history_max_entries,
+          'CLIPMESH_MAX_PAYLOAD_BYTES': clipmesh_max_payload_bytes,
+          'CLIPMESH_MAX_CONNECTIONS': clipmesh_max_connections,
+          'CLIPMESH_MAX_CONNECTIONS_PER_PEER': clipmesh_max_connections_per_peer,
+          'CLIPMESH_PUBLISH_TOKENS_PER_MINUTE': clipmesh_publish_tokens_per_minute,
+          'CLIPMESH_PUBLISH_BURST': clipmesh_publish_burst,
+          'CLIPMESH_OUTBOUND_QUEUE_MESSAGES': clipmesh_outbound_queue_messages,
+          'CLIPMESH_OUTBOUND_QUEUE_BYTES': clipmesh_outbound_queue_bytes
+        } | to_json
+      }}
+  changed_when: true
+  no_log: true

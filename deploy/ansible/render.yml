@@ -1,0 +1,7 @@
+---
+- name: Render inactive ClipMesh deployment assets
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - clipmesh

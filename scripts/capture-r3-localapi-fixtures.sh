@@ -1,7 +1,7 @@
 #!/bin/sh
 # Capture only from the test-local daemon simulator. This script never starts
-# a listener and refuses the system Tailscale socket. Fresh Tailnet captures
-# are deferred to R7 by the R3 boundary ruling.
+# a listener and refuses the system Tailscale socket. R7 accepts only this
+# process-local synthetic seam; a live Tailnet capture remains held.
 set -eu
 
 if [ "$#" -ne 1 ]; then

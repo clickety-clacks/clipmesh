@@ -1,0 +1,13 @@
+config_version = 1
+listen_address = "@@CLIPMESH_HUB_LISTEN_ADDRESS@@"
+tailscale_localapi = "system"
+state_directory = "@@CLIPMESH_HUB_STATE_DIRECTORY@@"
+retention_seconds = @@CLIPMESH_RETENTION_SECONDS@@
+history_max_entries = @@CLIPMESH_HISTORY_MAX_ENTRIES@@
+max_payload_bytes = @@CLIPMESH_MAX_PAYLOAD_BYTES@@
+max_connections = @@CLIPMESH_MAX_CONNECTIONS@@
+max_connections_per_peer = @@CLIPMESH_MAX_CONNECTIONS_PER_PEER@@
+publish_tokens_per_minute = @@CLIPMESH_PUBLISH_TOKENS_PER_MINUTE@@
+publish_burst = @@CLIPMESH_PUBLISH_BURST@@
+outbound_queue_messages = @@CLIPMESH_OUTBOUND_QUEUE_MESSAGES@@
+outbound_queue_bytes = @@CLIPMESH_OUTBOUND_QUEUE_BYTES@@

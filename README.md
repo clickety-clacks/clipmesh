@@ -28,6 +28,7 @@ The hub core provides SQLite-only ordering, retry, resume, acknowledgement,
 retention, shared clear, and canonical clip-content custody.
 
 The Linux Wayland and macOS native clipboard and lock-state adapters,
-owner-only Unix control seams, and inactive generic systemd and launchd
-templates are present. Packaging, deployment, listener activation, and
-private topology remain outside this repository slice.
+owner-only Unix control seams, inactive generic systemd and launchd templates,
+closed configuration templates, and render-only Ansible assets are present.
+Installation, service loading or activation, deployment, listener activation,
+and private topology remain outside this repository slice.

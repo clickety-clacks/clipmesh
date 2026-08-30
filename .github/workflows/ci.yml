@@ -12,6 +12,14 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
       - run: cargo test --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo doc --workspace --no-deps
+      - run: scripts/check-d3-desktop-boundary.sh
+      - run: scripts/check-r1-hub-policy-boundary.sh
+      - run: scripts/test-r1-hub-policy-boundary.sh
+      - run: scripts/test-r3-capture-sanitizer.sh
+      - run: scripts/check-r7-packaging.sh
       - run: scripts/check-repository-boundary.sh
       - run: scripts/test-repository-boundary.sh

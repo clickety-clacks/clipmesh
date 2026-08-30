@@ -1,0 +1,23 @@
+---
+clipmesh_render_output_directory: null
+clipmesh_hub_binary: null
+clipmesh_hub_config_path: null
+clipmesh_hub_listen_address: null
+clipmesh_hub_state_directory: null
+clipmesh_service_user: null
+clipmesh_service_group: null
+clipmesh_agent_binary: null
+clipmesh_agent_config_path: null
+clipmesh_agent_hub_url: null
+clipmesh_agent_platform: null
+clipmesh_agent_state_path: null
+clipmesh_agent_control_socket: null
+clipmesh_retention_seconds: 604800
+clipmesh_history_max_entries: 500
+clipmesh_max_payload_bytes: 262144
+clipmesh_max_connections: 64
+clipmesh_max_connections_per_peer: 2
+clipmesh_publish_tokens_per_minute: 60
+clipmesh_publish_burst: 10
+clipmesh_outbound_queue_messages: 64
+clipmesh_outbound_queue_bytes: 2097152

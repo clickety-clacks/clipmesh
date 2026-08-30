@@ -1,8 +1,9 @@
 # Generic macOS launchd asset
 
-`com.example.clipmesh-agent.plist` is an inactive template. Replace each
-`@@...@@` token outside this repository with a deployment-specific value.
-The template contains no application identity or credential. `RunAtLoad` and
+`com.example.clipmesh-agent.plist` is an inactive template. Render each
+`@@...@@` token outside this repository with
+`scripts/render-r7-packaging.py` or the render-only Ansible playbook. The
+template contains no application identity or credential. `RunAtLoad` and
 `KeepAlive` are false, and this repository does not load or start the job.
 
 The configuration path supplies the remaining generic desktop settings. The
