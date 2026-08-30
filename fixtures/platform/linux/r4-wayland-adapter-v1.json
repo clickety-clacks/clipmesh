@@ -1,0 +1,22 @@
+{
+  "clipboard_kind": "isolated_headless_wayland",
+  "compositor_protocol": "wlr-data-control-v1",
+  "invalid_utf8_write_preserved": true,
+  "local_bytes_utf8": "clipmesh-local-capture",
+  "local_hint": "Ordinary",
+  "local_mime_types": [
+    "STRING",
+    "TEXT",
+    "UTF8_STRING",
+    "application/x-clipmesh-unverified",
+    "text/plain",
+    "text/plain;charset=utf-8"
+  ],
+  "local_revision_current_before_remote": true,
+  "lock_state": "Unknown",
+  "lock_state_acts_locked": true,
+  "remote_bytes_utf8": "clipmesh-remote-capture\nline-two",
+  "remote_hint": "Ordinary",
+  "remote_revision_current": true,
+  "schema_version": 1
+}
