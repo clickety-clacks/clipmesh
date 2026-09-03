@@ -32,6 +32,15 @@ pub enum LockState {
     Unknown,
 }
 
+fn classify_lock_state(screen_is_locked: Option<bool>, on_console: Option<bool>) -> LockState {
+    match screen_is_locked {
+        Some(true) => LockState::Locked,
+        Some(false) => LockState::Unlocked,
+        None if on_console == Some(true) => LockState::Unlocked,
+        None => LockState::Unknown,
+    }
+}
+
 impl LockState {
     pub fn acts_locked(self) -> bool {
         self != Self::Unlocked
@@ -452,7 +461,7 @@ impl ClipboardAdapter for MacPasteboard {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{LockState, MacAdapterError};
+    use super::{classify_lock_state, LockState, MacAdapterError};
     use clipmesh_agent_core::PlatformRevision;
     use core_foundation::{
         base::{CFType, TCFType},
@@ -605,18 +614,31 @@ mod platform {
         }
         let dictionary: CFDictionary<CFString, CFType> =
             unsafe { TCFType::wrap_under_create_rule(raw) };
-        let key = CFString::new("CGSSessionScreenIsLocked");
-        let Some(value) = dictionary.find(&key) else {
-            return LockState::Unknown;
+        let screen_is_locked_key = CFString::new("CGSSessionScreenIsLocked");
+        let screen_is_locked = match dictionary.find(&screen_is_locked_key) {
+            Some(value) => {
+                let Some(value) = value.downcast::<CFBoolean>() else {
+                    return LockState::Unknown;
+                };
+                Some(bool::from(value))
+            }
+            None => None,
         };
-        let Some(value) = value.downcast::<CFBoolean>() else {
-            return LockState::Unknown;
-        };
-        if bool::from(value) {
-            LockState::Locked
-        } else {
-            LockState::Unlocked
+        if screen_is_locked.is_some() {
+            return classify_lock_state(screen_is_locked, None);
         }
+
+        let on_console_key = CFString::new("kCGSSessionOnConsoleKey");
+        let on_console = match dictionary.find(&on_console_key) {
+            Some(value) => {
+                let Some(value) = value.downcast::<CFBoolean>() else {
+                    return LockState::Unknown;
+                };
+                Some(bool::from(value))
+            }
+            None => None,
+        };
+        classify_lock_state(None, on_console)
     }
 }
 
@@ -684,6 +706,15 @@ mod tests {
         fn current_lock_state(&mut self) -> LockState {
             self.0.pop_front().unwrap_or(LockState::Unknown)
         }
+    }
+
+    #[test]
+    fn core_graphics_lock_state_classification_is_fail_closed() {
+        assert_eq!(classify_lock_state(Some(true), None), LockState::Locked);
+        assert_eq!(classify_lock_state(Some(false), None), LockState::Unlocked);
+        assert_eq!(classify_lock_state(None, Some(true)), LockState::Unlocked);
+        assert_eq!(classify_lock_state(None, Some(false)), LockState::Unknown);
+        assert_eq!(classify_lock_state(None, None), LockState::Unknown);
     }
 
     #[test]
