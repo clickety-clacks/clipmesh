@@ -31,6 +31,7 @@ const PROTOCOL: &str = "clipmesh.v1";
 const MAX_HEADERS: usize = 16_384;
 
 const SYSTEM_LOCALAPI_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
+const LOCALAPI_HOST: &str = "local-tailscaled.sock";
 const LOCALAPI_RESPONSE_LIMIT: usize = 131_072;
 
 /// The upstream LocalAPI response contract that this adapter supports.
@@ -145,13 +146,7 @@ impl SystemLocalApi {
             .set_write_timeout(timeout)
             .map_err(LocalApiError::from_io)?;
         stream
-            .write_all(
-                format!(
-                    "GET {target} HTTP/1.1\\r\\nHost: example.invalid\\r\\nConnection: close\\r\\n\\r\\n"
-                )
-                .replace(r"\\r\\n", "\r\n")
-                .as_bytes(),
-            )
+            .write_all(localapi_request(target).as_bytes())
             .map_err(LocalApiError::from_io)?;
         let mut response = Vec::new();
         stream
@@ -161,16 +156,118 @@ impl SystemLocalApi {
         if response.len() > LOCALAPI_RESPONSE_LIMIT {
             return Err(LocalApiError::MalformedResponse);
         }
-        let response =
-            std::str::from_utf8(&response).map_err(|_| LocalApiError::MalformedResponse)?;
-        let (head, body) = response
-            .split_once("\r\n\r\n")
-            .ok_or(LocalApiError::MalformedResponse)?;
-        if !head.starts_with("HTTP/1.1 200 ") && !head.starts_with("HTTP/1.0 200 ") {
-            return Err(LocalApiError::PeerNotFound);
-        }
-        serde_json::from_str(body).map_err(|_| LocalApiError::MalformedResponse)
+        parse_localapi_response(&response)
     }
+}
+
+fn localapi_request(target: &str) -> String {
+    format!("GET {target} HTTP/1.1\r\nHost: {LOCALAPI_HOST}\r\nConnection: close\r\n\r\n")
+}
+
+fn parse_localapi_response(response: &[u8]) -> Result<Value, LocalApiError> {
+    let response = std::str::from_utf8(response).map_err(|_| LocalApiError::MalformedResponse)?;
+    let (head, encoded_body) = response
+        .split_once("\r\n\r\n")
+        .ok_or(LocalApiError::MalformedResponse)?;
+    let mut lines = head.split("\r\n");
+    let status = lines.next().ok_or(LocalApiError::MalformedResponse)?;
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
+        return Err(LocalApiError::PeerNotFound);
+    }
+
+    let mut transfer_encoding = None;
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(LocalApiError::MalformedResponse)?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            if transfer_encoding.replace(value).is_some() {
+                return Err(LocalApiError::MalformedResponse);
+            }
+        } else if name.eq_ignore_ascii_case("content-length")
+            && content_length.replace(value).is_some()
+        {
+            return Err(LocalApiError::MalformedResponse);
+        }
+    }
+
+    let decoded_body;
+    let body = if let Some(encoding) = transfer_encoding {
+        if content_length.is_some() || !encoding.eq_ignore_ascii_case("chunked") {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        decoded_body = decode_chunked_body(encoded_body.as_bytes())?;
+        std::str::from_utf8(&decoded_body).map_err(|_| LocalApiError::MalformedResponse)?
+    } else if let Some(length) = content_length {
+        let length = length
+            .parse::<usize>()
+            .map_err(|_| LocalApiError::MalformedResponse)?;
+        if encoded_body.len() != length {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        encoded_body
+    } else {
+        encoded_body
+    };
+
+    serde_json::from_str(body).map_err(|_| LocalApiError::MalformedResponse)
+}
+
+fn decode_chunked_body(mut encoded: &[u8]) -> Result<Vec<u8>, LocalApiError> {
+    let mut decoded = Vec::new();
+    loop {
+        let (size_line, rest) = split_crlf(encoded)?;
+        let size_line =
+            std::str::from_utf8(size_line).map_err(|_| LocalApiError::MalformedResponse)?;
+        let size = usize::from_str_radix(
+            size_line
+                .split_once(';')
+                .map_or(size_line, |(size, _)| size)
+                .trim(),
+            16,
+        )
+        .map_err(|_| LocalApiError::MalformedResponse)?;
+        encoded = rest;
+
+        if size == 0 {
+            loop {
+                let (trailer, rest) = split_crlf(encoded)?;
+                encoded = rest;
+                if trailer.is_empty() {
+                    return if encoded.is_empty() {
+                        Ok(decoded)
+                    } else {
+                        Err(LocalApiError::MalformedResponse)
+                    };
+                }
+                if !trailer.contains(&b':') {
+                    return Err(LocalApiError::MalformedResponse);
+                }
+            }
+        }
+
+        let chunk = encoded
+            .get(..size)
+            .ok_or(LocalApiError::MalformedResponse)?;
+        if decoded.len().saturating_add(chunk.len()) > LOCALAPI_RESPONSE_LIMIT {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        decoded.extend_from_slice(chunk);
+        encoded = encoded
+            .get(size..)
+            .and_then(|rest| rest.strip_prefix(b"\r\n"))
+            .ok_or(LocalApiError::MalformedResponse)?;
+    }
+}
+
+fn split_crlf(bytes: &[u8]) -> Result<(&[u8], &[u8]), LocalApiError> {
+    let boundary = bytes
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or(LocalApiError::MalformedResponse)?;
+    Ok((&bytes[..boundary], &bytes[boundary + 2..]))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1940,9 +2037,15 @@ mod tests {
     const NOW: i64 = 1_700_000_000_000;
     const LOCALAPI_COMPATIBILITY_CONTRACT: &str =
         include_str!("../tests/fixtures/r3-localapi-compatibility-v1.json");
+    const LOCALAPI_HTTP_FRAMING_FIXTURE: &str =
+        include_str!("../tests/fixtures/localapi-http-framing-v1.json");
 
     fn compatibility_contract() -> Value {
         serde_json::from_str(LOCALAPI_COMPATIBILITY_CONTRACT).unwrap()
+    }
+
+    fn http_framing_fixture() -> Value {
+        serde_json::from_str(LOCALAPI_HTTP_FRAMING_FIXTURE).unwrap()
     }
 
     #[derive(Clone)]
@@ -2328,6 +2431,25 @@ mod tests {
                 .unwrap(),
             "peer-reserved-example"
         );
+    }
+
+    #[test]
+    fn localapi_uses_the_accepted_host_and_decodes_chunked_success_responses() {
+        let fixture = http_framing_fixture();
+        let request = localapi_request("/localapi/v0/status");
+        assert!(request.contains(&format!(
+            "\r\nHost: {}\r\n",
+            fixture["request_host"].as_str().unwrap()
+        )));
+
+        let status =
+            parse_localapi_response(fixture["status_response"].as_str().unwrap().as_bytes())
+                .unwrap();
+        assert_eq!(status["TailscaleIPs"], json!(["100.64.0.7"]));
+
+        let whois = parse_localapi_response(fixture["whois_response"].as_str().unwrap().as_bytes())
+            .unwrap();
+        assert_eq!(whois["Node"]["StableID"], "peer-reserved-example");
     }
 
     #[test]
