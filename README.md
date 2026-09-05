@@ -16,6 +16,16 @@ its canonical reviewed specification reference.
 
 ## Status
 
+`main` contains the current implementation and is the default development
+target. The former `0.1.0` quarantine-only policy and separate quarantine-to-main
+approval gate no longer apply (Mike's source-development ruling, 2026-09-05).
+Existing branches remain preserved. Source development does not authorize
+release publication, permanent installation, or deployment.
+
+The mobile project is [mobile/ClipMesh/ClipMesh.xcodeproj](mobile/ClipMesh/ClipMesh.xcodeproj).
+Live acceptance remains partial; availability on `main` is not a full-acceptance
+or release claim.
+
 The immutable Rust protocol foundation, the remediated transport-neutral hub
 policy core, the persistent desktop domain core, and the explicit Tailnet hub
 and desktop agent executables are present. The desktop core provides outbox,
