@@ -1,5 +1,5 @@
 {
-  "provenance": "Sanitized regression shape from bounded LocalAPI compatibility evidence art_184a7ad8; payload values remain reserved examples.",
+  "provenance": "Explicit synthetic parser regression, not captured LocalAPI bytes. The accepted Host and chunked framing follow compatibility evidence art_184a7ad8; payload values are reserved examples.",
   "request_host": "local-tailscaled.sock",
   "status_response": "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n1f\r\n{\"TailscaleIPs\":[\"100.64.0.7\"]}\r\n0\r\n\r\n",
   "whois_response": "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n2d\r\n{\"Node\":{\"StableID\":\"peer-reserved-example\"}}\r\n0\r\n\r\n"
