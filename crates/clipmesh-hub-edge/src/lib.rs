@@ -120,9 +120,21 @@ impl SystemLocalApi {
         {
             return Err(LocalApiError::MalformedResponse);
         }
-        if ["UserProfile", "CapMap"]
-            .into_iter()
-            .any(|field| object.get(field).is_some_and(|value| !value.is_object()))
+        if object
+            .get("UserProfile")
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        // `CapMap` is a Go map in the pinned `apitype.WhoIsResponse`, so a peer
+        // that carries no capability grant is encoded as JSON `null`, not `{}`.
+        // Null is that peer's empty grant set under the same pinned contract,
+        // not a later or malformed shape, and it must not cost the peer its
+        // identity. Every other field stays pinned; `Node.StableID` below is
+        // still what admits the peer.
+        if object
+            .get("CapMap")
+            .is_some_and(|value| !value.is_object() && !value.is_null())
         {
             return Err(LocalApiError::MalformedResponse);
         }
@@ -2060,6 +2072,7 @@ mod tests {
         address: IpAddr,
         documented_shape: bool,
         malformed_whois_shape: bool,
+        null_capability_map: bool,
         requests: Vec<String>,
     }
 
@@ -2075,6 +2088,7 @@ mod tests {
                 address: "100.64.0.7".parse().unwrap(),
                 documented_shape: false,
                 malformed_whois_shape: false,
+                null_capability_map: false,
                 requests: Vec::new(),
             }));
             let server_state = Arc::clone(&state);
@@ -2108,6 +2122,9 @@ mod tests {
                                     if state.malformed_whois_shape {
                                         contract["whois"]["UserProfile"] = json!("malformed");
                                         contract["whois"]["CapMap"] = json!([]);
+                                    }
+                                    if state.null_capability_map {
+                                        contract["whois"]["CapMap"] = Value::Null;
                                     }
                                     serde_json::to_string(&contract["whois"]).unwrap()
                                 } else {
@@ -2462,6 +2479,33 @@ mod tests {
         assert_eq!(
             daemon.client().who_is("100.64.0.9:12345".parse().unwrap()),
             Err(LocalApiError::MalformedResponse)
+        );
+    }
+
+    /// Explicit synthetic parser regression, not a captured LocalAPI response.
+    /// It varies exactly one field of the pinned WhoIs shape, the way
+    /// `malformed_whois_profile_or_capabilities_fail_the_pinned_contract`
+    /// does. A real sanitized WhoIs capture stays a post-MVP sanity check.
+    #[test]
+    fn a_null_capability_map_still_identifies_the_whois_peer() {
+        let daemon = LocalApiSimulator::admitted();
+        let mut state = daemon.state.lock().unwrap();
+        state.documented_shape = true;
+        state.null_capability_map = true;
+        drop(state);
+        assert_eq!(
+            daemon
+                .client()
+                .who_is("100.64.0.9:12345".parse().unwrap())
+                .unwrap(),
+            "peer-reserved-example"
+        );
+
+        // A null capability map must not buy a peer past identity validation.
+        daemon.state.lock().unwrap().peer = Some("");
+        assert_eq!(
+            daemon.client().who_is("100.64.0.9:12345".parse().unwrap()),
+            Err(LocalApiError::PeerNotFound)
         );
     }
 
