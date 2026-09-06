@@ -7,6 +7,9 @@ final class MobileSessionModel {
     private(set) var lifecycleState: MobileLifecycleState = .inactive
     private(set) var visibleHistory: [HistoryRowPresentation] = []
     private(set) var errorCode: String?
+    private(set) var actionFeedback: String?
+    private(set) var pendingPublishID: UUID?
+    @ObservationIgnored private var publishTask: Task<Void, Never>?
     var hubURLText: String
 
     @ObservationIgnored private let codec = ProtocolV1Codec()
@@ -61,6 +64,7 @@ final class MobileSessionModel {
     }
 
     func deactivate() {
+        cancelPublish()
         connectionTask?.cancel()
         connectionTask = nil
         acknowledgementTask?.cancel()
@@ -108,9 +112,71 @@ final class MobileSessionModel {
         }
         do {
             try pasteboard.write(clip.content)
+            actionFeedback = "Copied to iPhone clipboard"
         } catch {
             transitionToError(ReasonCodeV1.adapterUnavailable.rawValue)
         }
+    }
+
+    var canPublish: Bool {
+        lifecycleState == .foregroundLive && pendingPublishID == nil
+    }
+
+    // A system paste-permission alert can temporarily deactivate the scene.
+    // Only an already requested clipboard read may wait for that transition.
+    // Never retain it indefinitely or retry it on a later launch.
+    func finishExplicitClipboardRead(_ text: String?) async {
+        for _ in 0 ..< 60 {
+            if lifecycleState == .foregroundLive || lifecycleState == .foregroundError { break }
+            do { try await Task.sleep(for: .milliseconds(50)) }
+            catch { return }
+        }
+        guard canPublish else {
+            actionFeedback = "Connection changed. Tap Copy to ClipMesh to try again."
+            return
+        }
+        publishClipboardText(text)
+    }
+
+    func publishClipboardText(_ text: String?) {
+        guard canPublish, let clearGeneration else { return }
+        guard let text, !text.isEmpty else {
+            actionFeedback = "Copy some text first. ClipMesh currently supports text only."
+            return
+        }
+        do {
+            let content = try ClipContentV1.fromPlatform(text, maximumBytes: maximumPayloadBytes)
+            let id = UUID()
+            pendingPublishID = id
+            actionFeedback = "Sending to ClipMesh…"
+            publishTask = Task {
+                do {
+                    try Task.checkCancellation()
+                    try await send(.publish(messageID: id, generation: clearGeneration,
+                                            createdAt: nowMilliseconds, content: content))
+                    try await Task.sleep(for: .seconds(10))
+                    guard pendingPublishID == id else { return }
+                    pendingPublishID = nil
+                    actionFeedback = "No confirmation received. Check ClipMesh before trying again."
+                } catch is CancellationError {
+                } catch {
+                    guard pendingPublishID == id else { return }
+                    pendingPublishID = nil
+                    actionFeedback = "Could not confirm the copy to ClipMesh."
+                }
+            }
+        } catch {
+            actionFeedback = "This text could not be sent. It may exceed the server's size limit."
+        }
+    }
+
+    private func cancelPublish() {
+        publishTask?.cancel()
+        publishTask = nil
+        if pendingPublishID != nil {
+            actionFeedback = "Copy interrupted. Check ClipMesh before trying again."
+        }
+        pendingPublishID = nil
     }
 
     func requestSharedClear() {
@@ -137,6 +203,7 @@ final class MobileSessionModel {
     }
 
     private func startConnection() {
+        cancelPublish()
         connectionTask?.cancel()
         acknowledgementTask?.cancel()
         acknowledgementTask = nil
@@ -250,8 +317,20 @@ final class MobileSessionModel {
         case let .error(value):
             transitionToError(value.code.rawValue)
             return nil
-        case .publishAccepted, .publishRejected:
-            throw ProtocolFailure.protocolSchemaInvalid
+        case let .publishAccepted(value):
+            if pendingPublishID == value.messageID {
+                pendingPublishID = nil
+                publishTask?.cancel()
+                actionFeedback = "Copied to ClipMesh"
+            }
+            return nil
+        case let .publishRejected(value):
+            if pendingPublishID != nil, value.messageID == nil || pendingPublishID == value.messageID {
+                pendingPublishID = nil
+                publishTask?.cancel()
+                actionFeedback = "ClipMesh rejected this copy: \(value.code.rawValue)"
+            }
+            return nil
         }
     }
 
@@ -333,9 +412,6 @@ final class MobileSessionModel {
                 throw ProtocolFailure.protocolSchemaInvalid
             }
             pruneExpiredHistory()
-            if isUnexpired, value.sourcePeerID != selfPeerID {
-                try pasteboard.write(value.content)
-            }
         }
 
         processedMessageIDs.insert(value.messageID)
@@ -507,6 +583,7 @@ final class MobileSessionModel {
     }
 
     private func transitionToError(_ code: String) {
+        cancelPublish()
         acknowledgementTask?.cancel()
         acknowledgementTask = nil
         clearRequestTask?.cancel()

@@ -3,6 +3,19 @@ import XCTest
 
 final class ProtocolV1CodecTests: XCTestCase {
     @MainActor
+    func testEncodedPublishMatchesCanonicalRustClientFixture() throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "publish-v1", withExtension: "json"))
+        let expected = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? NSDictionary)
+        let message = ClientMessageV1.publish(
+            messageID: try XCTUnwrap(UUID(uuidString: "00000000-0000-4000-8000-000000000001")),
+            generation: 1, createdAt: 1700000000000,
+            content: try ClipContentV1.fromPlatform("fixture text", maximumBytes: 262144)
+        )
+        let actual = try XCTUnwrap(JSONSerialization.jsonObject(with: codec.encodeClientMessage(message)) as? NSDictionary)
+        XCTAssertEqual(actual, expected)
+    }
+
+    @MainActor
     private let codec = ProtocolV1Codec()
 
     @MainActor

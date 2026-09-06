@@ -15,7 +15,12 @@ clips and advances one durable generation without changing any system
 clipboard.
 
 Resume material updates product history only. After catch-up, a new live clip
-from another peer directly overwrites an eligible system clipboard.
+from another peer directly overwrites an eligible desktop system clipboard.
+The iOS/iPadOS interaction is explicit, per Mike's 2026-09-06 ruling. Opening
+the app and receiving clips only refresh history and the latest preview.
+Copy to ClipMesh sends local clipboard text after a tap. Tapping the preview
+or a history entry copies that text to the device. Neither direction runs
+automatically on app launch.
 
 `ClipContentV1` is the one content serialization boundary for ingress, SQLite,
 egress, previews, and platform writes. Diagnostics contain no content or

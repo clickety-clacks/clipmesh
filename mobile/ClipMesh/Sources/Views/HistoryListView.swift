@@ -6,9 +6,9 @@ struct HistoryListView: View {
     var body: some View {
         if model.visibleHistory.isEmpty {
             ContentUnavailableView(
-                "No ClipMesh History",
+                "Nothing on ClipMesh yet",
                 systemImage: "doc.on.clipboard",
-                description: Text("Foreground catch-up and live text clips appear here."),
+                description: Text("Copy text on this device, then tap Copy to ClipMesh. Shared text will appear here."),
             )
         } else {
             List(model.visibleHistory) { row in

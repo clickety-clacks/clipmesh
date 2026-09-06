@@ -56,13 +56,30 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ClipMesh.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ClipMesh"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
+  ClipMeshUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: ClipMesh
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.ClipMeshUITests
+        SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+
 schemes:
   ClipMesh:
     build:
       targets:
         ClipMesh: all
         ClipMeshTests: [test]
+        ClipMeshUITests: [test]
     test:
       gatherCoverageData: true
+      environmentVariables:
+        CLIPMESH_TEST_HUB_URL: "$(CLIPMESH_TEST_HUB_URL)"
       targets:
         - ClipMeshTests
+        - ClipMeshUITests

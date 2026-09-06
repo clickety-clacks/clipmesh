@@ -3,7 +3,113 @@ import XCTest
 
 @MainActor
 final class MobileSessionModelTests: XCTestCase {
-    func testCatchUpDedupeLiveWriteLocalClearAndBackgroundAreOrdered() async throws {
+    func testExplicitReadCanFinishAfterPermissionReactivation() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(), ProtocolFixtures.resumeStarted(),
+            ProtocolFixtures.resumeComplete(boundary: nil),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(transport: transport, pasteboard: SyntheticPasteboardWriter(),
+                                       preferences: preferences, now: { ProtocolFixtures.now })
+        let completion = Task { await model.finishExplicitClipboardRead("synthetic permitted") }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(messageCount("publish", in: transport), 0)
+        model.activate()
+        await completion.value
+        try await waitUntil("explicit publish after permission") {
+            self.messageCount("publish", in: transport) == 1
+        }
+        model.deactivate()
+    }
+
+    func testAbandonedExplicitReadIsNotSentOnLaterLaunch() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(), ProtocolFixtures.resumeStarted(),
+            ProtocolFixtures.resumeComplete(boundary: nil),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(transport: transport, pasteboard: SyntheticPasteboardWriter(),
+                                       preferences: preferences, now: { ProtocolFixtures.now })
+        await model.finishExplicitClipboardRead("synthetic abandoned")
+        model.activate()
+        try await waitUntil("connected") { model.canPublish }
+        XCTAssertEqual(messageCount("publish", in: transport), 0)
+        model.deactivate()
+    }
+
+    func testPublishRejectionAndOversizedTextDoNotReportSuccess() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(), ProtocolFixtures.resumeStarted(),
+            ProtocolFixtures.resumeComplete(boundary: nil),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(transport: transport, pasteboard: SyntheticPasteboardWriter(),
+                                       preferences: preferences, now: { ProtocolFixtures.now })
+        model.activate()
+        try await waitUntil("connected") { model.canPublish }
+        model.publishClipboardText(String(repeating: "x", count: 262145))
+        XCTAssertNil(model.pendingPublishID)
+        XCTAssertEqual(messageCount("publish", in: transport), 0)
+        model.publishClipboardText("synthetic rejected")
+        let id = try XCTUnwrap(model.pendingPublishID)
+        try await waitUntil("publish sent") { self.messageCount("publish", in: transport) == 1 }
+        transport.enqueue(ProtocolFixtures.data("""
+            {"protocol_version":1,"type":"publish_rejected","message_id":"\(id.uuidString.lowercased())","code":"publish_rate_limited","retryable":true}
+            """))
+        try await waitUntil("rejected") { model.pendingPublishID == nil }
+        XCTAssertEqual(model.actionFeedback, "ClipMesh rejected this copy: publish_rate_limited")
+        XCTAssertTrue(model.canPublish)
+        model.deactivate()
+    }
+
+    func testExplicitPublishWaitsForAcceptanceAndNeverWritesClipboard() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(), ProtocolFixtures.resumeStarted(),
+            ProtocolFixtures.resumeComplete(boundary: nil),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let pasteboard = SyntheticPasteboardWriter()
+        let model = MobileSessionModel(transport: transport, pasteboard: pasteboard,
+                                       preferences: preferences, now: { ProtocolFixtures.now })
+        model.publishClipboardText("inactive")
+        XCTAssertTrue(transport.sentMessages.isEmpty)
+        model.activate()
+        try await waitUntil("connected") { model.canPublish }
+        XCTAssertEqual(messageCount("publish", in: transport), 0)
+        model.publishClipboardText(nil)
+        model.publishClipboardText("")
+        XCTAssertNil(model.pendingPublishID)
+        model.publishClipboardText("fixture text")
+        let id = try XCTUnwrap(model.pendingPublishID)
+        model.publishClipboardText("double tap")
+        try await waitUntil("publish sent") { self.messageCount("publish", in: transport) == 1 }
+        XCTAssertEqual(model.actionFeedback, "Sending to ClipMesh…")
+        let messages = try transport.sentMessages.map {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: $0) as? [String: Any])
+        }
+        let publish = try XCTUnwrap(messages.first { $0["type"] as? String == "publish" })
+        let event = try XCTUnwrap(publish["event"] as? [String: Any])
+        XCTAssertEqual(event["payload_b64"] as? String, "Zml4dHVyZSB0ZXh0")
+        XCTAssertEqual(event["clear_generation"] as? String, "1")
+        transport.enqueue(ProtocolFixtures.data("""
+            {"protocol_version":1,"type":"publish_accepted","message_id":"\(id.uuidString.lowercased())","cursor":"1","expires_at_ms":1700604800000,"duplicate":false}
+            """))
+        try await waitUntil("accepted") { model.pendingPublishID == nil }
+        XCTAssertEqual(model.actionFeedback, "Copied to ClipMesh")
+        XCTAssertTrue(pasteboard.writes.isEmpty)
+        XCTAssertEqual(model.lifecycleState, .foregroundLive)
+        model.publishClipboardText("interrupted")
+        model.deactivate()
+        XCTAssertNil(model.pendingPublishID)
+        XCTAssertFalse(model.canPublish)
+        XCTAssertTrue(pasteboard.writes.isEmpty)
+    }
+
+    func testCatchUpDedupeLivePreviewLocalClearAndBackgroundNeverWrite() async throws {
         let resume = ProtocolFixtures.event(
             delivery: "resume",
             cursor: 1,
@@ -61,20 +167,20 @@ final class MobileSessionModelTests: XCTestCase {
                 && transport.isWaitingForInput
         }
 
-        XCTAssertEqual(pasteboard.writes.count, 1)
-        XCTAssertTrue(pasteboard.writes.first == "synthetic live")
+        XCTAssertEqual(pasteboard.writes.count, 0)
+        XCTAssertTrue(pasteboard.writes.isEmpty)
         XCTAssertEqual(model.visibleHistory.map(\.cursor), [3, 2, 1])
         XCTAssertTrue(transport.sentMessages.contains { String(decoding: $0, as: UTF8.self).contains("\"type\":\"resume\"") })
         XCTAssertEqual(messageCount("ack", in: transport), 1)
 
         model.clearLocalHistory()
         XCTAssertTrue(model.visibleHistory.isEmpty)
-        XCTAssertEqual(pasteboard.writes.count, 1)
+        XCTAssertEqual(pasteboard.writes.count, 0)
 
         transport.enqueue(live)
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertTrue(model.visibleHistory.isEmpty)
-        XCTAssertEqual(pasteboard.writes.count, 1)
+        XCTAssertEqual(pasteboard.writes.count, 0)
 
         model.deactivate()
         transport.enqueue(
@@ -88,7 +194,7 @@ final class MobileSessionModelTests: XCTestCase {
         )
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(model.lifecycleState, .inactive)
-        XCTAssertEqual(pasteboard.writes.count, 1)
+        XCTAssertEqual(pasteboard.writes.count, 0)
     }
 
     func testFiveHundredResumeRowsStayStaleAndNeverWriteUntilCatchUpCompletes() async throws {
@@ -156,7 +262,7 @@ final class MobileSessionModelTests: XCTestCase {
         model.deactivate()
     }
 
-    func testReconnectGenerationCatchUpWritesOnlyTheFirstLaterLiveRemoteClip() async throws {
+    func testReconnectGenerationAndLaterLiveClipNeverWrite() async throws {
         let transport = SyntheticClipTransport(incoming: [
             ProtocolFixtures.hello(generation: 1, newestCursor: 1),
             ProtocolFixtures.resumeStarted(status: "fresh", generation: 1, boundaryCursor: 1),
@@ -220,8 +326,8 @@ final class MobileSessionModelTests: XCTestCase {
                 generation: 2,
             ),
         )
-        try await waitUntil("post-clear live write") { pasteboard.writes.count == 1 }
-        XCTAssertTrue(pasteboard.writes.first == "synthetic after clear")
+        try await waitUntil("post-clear live preview") { model.visibleHistory.count == 1 }
+        XCTAssertTrue(pasteboard.writes.isEmpty)
         model.deactivate()
     }
 
@@ -296,7 +402,7 @@ final class MobileSessionModelTests: XCTestCase {
         model.activate()
         try await waitUntil("clear notice") { model.lifecycleState == .foregroundLive && model.visibleHistory.isEmpty }
 
-        XCTAssertEqual(pasteboard.writes.count, 1)
+        XCTAssertEqual(pasteboard.writes.count, 0)
         model.deactivate()
     }
 

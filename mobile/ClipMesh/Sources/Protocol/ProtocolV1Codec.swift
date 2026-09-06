@@ -58,6 +58,20 @@ struct ProtocolV1Codec {
 
     func encodeClientMessage(_ message: ClientMessageV1) throws -> Data {
         let object: [String: Any] = switch message {
+        case let .publish(messageID, generation, createdAt, content):
+            [
+                "protocol_version": 1,
+                "type": "publish",
+                "event": [
+                    "message_id": messageID.uuidString.lowercased(),
+                    "clear_generation": String(generation),
+                    "created_at_ms": createdAt,
+                    "content_type": content.toWire().contentType,
+                    "payload_b64": content.toWire().payloadBase64URL,
+                    "payload_bytes": content.toWire().payloadBytes,
+                    "content_sha256": content.toWire().contentSHA256,
+                ],
+            ]
         case let .resume(value):
             [
                 "protocol_version": 1,

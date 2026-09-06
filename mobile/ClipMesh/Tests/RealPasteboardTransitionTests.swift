@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class RealPasteboardTransitionTests: XCTestCase {
-    func testRealGeneralPasteboardChangesOnlyForEligibleLiveRemoteClip() async throws {
+    func testRealGeneralPasteboardChangesOnlyWhenUserSelectsClip() async throws {
         let pasteboard = UIPasteboard.general
         pasteboard.string = "synthetic direct overwrite"
         let baselineChangeCount = pasteboard.changeCount
@@ -37,7 +37,7 @@ final class RealPasteboardTransitionTests: XCTestCase {
         )
 
         model.activate()
-        let expectation = expectation(description: "one live pasteboard write")
+        let expectation = expectation(description: "live preview received")
         let task = Task { @MainActor in
             while model.lifecycleState != .foregroundLive || model.visibleHistory.count != 2 {
                 try await Task.sleep(for: .milliseconds(5))
@@ -47,23 +47,23 @@ final class RealPasteboardTransitionTests: XCTestCase {
         await fulfillment(of: [expectation], timeout: 2)
         task.cancel()
 
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 0)
         XCTAssertTrue(pasteboard.string == "synthetic direct overwrite")
 
         let retainedRow = try XCTUnwrap(model.visibleHistory.first(where: { $0.cursor == 1 }))
         model.copyHistoryItem(retainedRow.id)
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 2)
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
         XCTAssertTrue(pasteboard.string == "synthetic retained")
 
         model.clearLocalHistory()
         XCTAssertTrue(model.visibleHistory.isEmpty)
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 2)
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
 
         model.deactivate()
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 2)
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
     }
 
-    func testRealGeneralPasteboardGenerationCatchUpWritesOnlyTheLaterLiveRemoteClip() async throws {
+    func testRealGeneralPasteboardGenerationCatchUpAndLiveNeverWrite() async throws {
         let pasteboard = UIPasteboard.general
         pasteboard.string = "synthetic offline baseline"
         let baselineChangeCount = pasteboard.changeCount
@@ -121,8 +121,9 @@ final class RealPasteboardTransitionTests: XCTestCase {
                 generation: 2,
             ),
         )
-        try await waitUntil("first later live") { pasteboard.changeCount - baselineChangeCount == 1 }
-        XCTAssertTrue(pasteboard.string == "synthetic first later live")
+        try await waitUntil("first later live") { model.visibleHistory.count == 1 }
+        XCTAssertEqual(pasteboard.changeCount, baselineChangeCount)
+        XCTAssertTrue(pasteboard.string == "synthetic offline baseline")
         model.deactivate()
     }
 
@@ -163,10 +164,10 @@ final class RealPasteboardTransitionTests: XCTestCase {
         await fulfillment(of: [expectation], timeout: 2)
         task.cancel()
 
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
-        XCTAssertTrue(pasteboard.string == "synthetic before shared clear")
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 0)
+        XCTAssertTrue(pasteboard.string == "synthetic clear baseline")
         model.deactivate()
-        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 1)
+        XCTAssertEqual(pasteboard.changeCount - baselineChangeCount, 0)
     }
 
     private func waitUntil(_ label: String, condition: @escaping @MainActor () -> Bool) async throws {

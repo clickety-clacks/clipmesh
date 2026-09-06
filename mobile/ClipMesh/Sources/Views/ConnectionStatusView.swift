@@ -19,7 +19,9 @@ struct ConnectionStatusView: View {
         case .foregroundConnecting:
             "Connecting and catching up"
         case .foregroundError:
-            errorCode.map { "Connection error: \($0)" } ?? "Connection error"
+            errorCode == ReasonCodeV1.configMissingRequired.rawValue
+                ? "Set your ClipMesh hub in Settings to connect."
+                : "Could not connect. Check Settings or tap Refresh."
         case .foregroundLive:
             "Live"
         case .inactive:

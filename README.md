@@ -5,8 +5,10 @@ machines already connected by a trusted overlay network such as Tailscale.
 
 The project is intentionally text-first and topology-neutral. Desktop agents
 automatically exchange clipboard text through a hub, while the iOS/iPadOS app
-shows recent entries and lets the user explicitly copy one into the system
-pasteboard.
+leaves the system clipboard untouched when opened or when clips arrive.
+Tap **Copy to ClipMesh** to send clipboard text. Tap the latest clip preview
+or a history entry to copy it to the device. Sending reports success only
+after the hub accepts the clip. iOS may ask permission to paste when sending.
 
 Rust is the default implementation language for the hub, protocol, and desktop
 agents. The Apple mobile client uses SwiftUI and native platform APIs.

@@ -52,6 +52,7 @@
 		BDE68D46F5D3F5AABD1E2406 /* publish-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 3185D6199F8E5FFA323D9792 /* publish-v1.json */; };
 		C83DA24C906E2C7B773D6B6B /* ServerHelloV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 511A61E4E7C57EA3A32DF1AB /* ServerHelloV1.swift */; };
 		DFA939C70A2DA95DB507EF55 /* PublishAcceptedV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 650385478DF728149B5B4787 /* PublishAcceptedV1.swift */; };
+		E19E788C8CE80A7925E50A2B /* ExplicitClipboardUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B615D4C13268EDAE103FEF95 /* ExplicitClipboardUITests.swift */; };
 		E9B0848EB6EE72094C86CEA6 /* EventV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CCCC1CE560DDF2E08FD510E /* EventV1.swift */; };
 		EAA6D3AF51FE129D96B4982D /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F4E7F1DE79BC5FAB133DA84 /* ContentView.swift */; };
 		EEA8472258BD63A5319C2F65 /* rust-hub-frames-v1.jsonl in Resources */ = {isa = PBXBuildFile; fileRef = 568481E8734A0FC41540357B /* rust-hub-frames-v1.jsonl */; };
@@ -66,6 +67,13 @@
 
 /* Begin PBXContainerItemProxy section */
 		AF58C3B7EFF6B42B45A8C14D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F8D9BC04A6D1152C9C57E77A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FA6CF22DCD0B19C6DC2B214E;
+			remoteInfo = ClipMesh;
+		};
+		C47097BA31EC7183B6A8F0FC /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = F8D9BC04A6D1152C9C57E77A /* Project object */;
 			proxyType = 1;
@@ -116,6 +124,7 @@
 		78FAAB31F35CA6236C8197BA /* PasteboardWriting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteboardWriting.swift; sourceTree = "<group>"; };
 		8581A85D7A71869A616F4B3B /* SystemPasteboardWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemPasteboardWriter.swift; sourceTree = "<group>"; };
 		89A66DB47537E8219584C395 /* ClearNoticeV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClearNoticeV1.swift; sourceTree = "<group>"; };
+		8B0A3DB6CF6E4EBEBD0F0A75 /* ClipMeshUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = ClipMeshUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		8B6821895FD19D2C82FD4994 /* ConnectionSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionSettingsView.swift; sourceTree = "<group>"; };
 		8CF5DE5C38B0D2396D837162 /* HubEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HubEndpoint.swift; sourceTree = "<group>"; };
 		9152B18F910FF640C8789F2D /* PreferencesStoring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferencesStoring.swift; sourceTree = "<group>"; };
@@ -123,6 +132,7 @@
 		9B2095229F97C2354FE7019B /* ResumeStatusV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResumeStatusV1.swift; sourceTree = "<group>"; };
 		A45814B86DB0CE3237FFD24D /* HistoryListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryListView.swift; sourceTree = "<group>"; };
 		A71CA1731503112822DA488D /* ClearHistoryRequestV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClearHistoryRequestV1.swift; sourceTree = "<group>"; };
+		B615D4C13268EDAE103FEF95 /* ExplicitClipboardUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExplicitClipboardUITests.swift; sourceTree = "<group>"; };
 		BE1C7E6594DABA1F77C1DFB2 /* ProtectedPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtectedPreferences.swift; sourceTree = "<group>"; };
 		D02DAB69572AAEDBF8A3515E /* InactiveCoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InactiveCoverView.swift; sourceTree = "<group>"; };
 		D2034990BFD88D9BA4A76881 /* DeliveryV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeliveryV1.swift; sourceTree = "<group>"; };
@@ -163,6 +173,7 @@
 			children = (
 				178FB34101501B151C684126 /* ClipMesh.app */,
 				40485A86CAEDC5D7669DBA3D /* ClipMeshTests.xctest */,
+				8B0A3DB6CF6E4EBEBD0F0A75 /* ClipMeshUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -207,6 +218,14 @@
 				E34FA2ED860BE0E9FDC0E150 /* WireContentV1.swift */,
 			);
 			path = Protocol;
+			sourceTree = "<group>";
+		};
+		7E22C130339A92B124D01A33 /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				B615D4C13268EDAE103FEF95 /* ExplicitClipboardUITests.swift */,
+			);
+			path = UITests;
 			sourceTree = "<group>";
 		};
 		858F43A3E1C47EA0572595B4 /* Sources */ = {
@@ -260,6 +279,7 @@
 				C3E3545A0865D4351DF9BB7D /* protocol */,
 				858F43A3E1C47EA0572595B4 /* Sources */,
 				F1C778E12D89C94272C6A02A /* Tests */,
+				7E22C130339A92B124D01A33 /* UITests */,
 				65CDB853FE7CE4A0CDC6D45E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -318,6 +338,24 @@
 			productReference = 40485A86CAEDC5D7669DBA3D /* ClipMeshTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		9A42FFC8830363BD5844CB98 /* ClipMeshUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 75AE950241EA07CB12B5A1AB /* Build configuration list for PBXNativeTarget "ClipMeshUITests" */;
+			buildPhases = (
+				24447E0D58573EE316980DC2 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B9AE2DBED781CF6DEE2C667A /* PBXTargetDependency */,
+			);
+			name = ClipMeshUITests;
+			packageProductDependencies = (
+			);
+			productName = ClipMeshUITests;
+			productReference = 8B0A3DB6CF6E4EBEBD0F0A75 /* ClipMeshUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 		FA6CF22DCD0B19C6DC2B214E /* ClipMesh */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 895903132A304A8375548736 /* Build configuration list for PBXNativeTarget "ClipMesh" */;
@@ -343,6 +381,11 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					9A42FFC8830363BD5844CB98 = {
+						TestTargetID = FA6CF22DCD0B19C6DC2B214E;
+					};
+				};
 			};
 			buildConfigurationList = E05CCAF9178BBFC5DCC7886F /* Build configuration list for PBXProject "ClipMesh" */;
 			compatibilityVersion = "Xcode 14.0";
@@ -360,6 +403,7 @@
 			targets = (
 				FA6CF22DCD0B19C6DC2B214E /* ClipMesh */,
 				0675E159DD3F6131035E9668 /* ClipMeshTests */,
+				9A42FFC8830363BD5844CB98 /* ClipMeshUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -390,6 +434,14 @@
 				2F986BF4F6C6DBB2B133653B /* RealPasteboardTransitionTests.swift in Sources */,
 				07224794C1B4A7283AC9FAA5 /* SyntheticClipTransport.swift in Sources */,
 				86E99AD3D405D160E8956D44 /* SyntheticPasteboardWriter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		24447E0D58573EE316980DC2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E19E788C8CE80A7925E50A2B /* ExplicitClipboardUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -447,6 +499,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		B9AE2DBED781CF6DEE2C667A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FA6CF22DCD0B19C6DC2B214E /* ClipMesh */;
+			targetProxy = C47097BA31EC7183B6A8F0FC /* PBXContainerItemProxy */;
+		};
 		FCBA78C17E33E18661AE5748 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = FA6CF22DCD0B19C6DC2B214E /* ClipMesh */;
@@ -455,6 +512,24 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		003509490AB5C72D05DAD01D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshUITests;
+				SDKROOT = iphoneos;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = ClipMesh;
+			};
+			name = Release;
+		};
 		37872E85B28706DB2E539B84 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -660,9 +735,36 @@
 			};
 			name = Debug;
 		};
+		E65F51E480D7E4B953890128 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshUITests;
+				SDKROOT = iphoneos;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = ClipMesh;
+			};
+			name = Debug;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		75AE950241EA07CB12B5A1AB /* Build configuration list for PBXNativeTarget "ClipMeshUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E65F51E480D7E4B953890128 /* Debug */,
+				003509490AB5C72D05DAD01D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		895903132A304A8375548736 /* Build configuration list for PBXNativeTarget "ClipMesh" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
