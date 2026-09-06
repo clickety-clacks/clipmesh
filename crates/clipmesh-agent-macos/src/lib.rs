@@ -171,8 +171,19 @@ impl OwnerControlSocket {
         {
             return Err(MacAdapterError::StatePathInsecure);
         }
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(MacAdapterError::StatePathInsecure);
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != owner_uid
+                || metadata.permissions().mode() & 0o777 != 0o600
+            {
+                return Err(MacAdapterError::StatePathInsecure);
+            }
+            match UnixStream::connect(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    fs::remove_file(path).map_err(|_| MacAdapterError::LocalStateUnavailable)?;
+                }
+                _ => return Err(MacAdapterError::StatePathInsecure),
+            }
         }
 
         let listener =
@@ -837,6 +848,22 @@ mod tests {
         let metadata = fs::metadata(server.path()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    }
+
+    #[test]
+    fn control_socket_restart_recovers_only_an_inactive_owned_socket() {
+        let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(OwnerControlSocket::bind(&path).is_err());
+        drop(listener);
+        let recovered = OwnerControlSocket::bind(&path).unwrap();
+        drop(recovered);
+        fs::write(&path, b"preserve").unwrap();
+        assert!(OwnerControlSocket::bind(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
     }
 
     #[test]
