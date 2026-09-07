@@ -398,11 +398,35 @@ fn classify_mime_types(types: &[String]) -> Result<HintClassification, LinuxAdap
     })
 }
 
+pub mod file_urls;
+
 pub struct WaylandClipboard {
     inner: platform_wayland::Clipboard,
 }
 
 impl WaylandClipboard {
+    #[cfg(target_os = "linux")]
+    pub fn current_revision(&self) -> Result<Option<PlatformRevision>, LinuxAdapterError> {
+        self.inner.current_revision()
+    }
+    #[cfg(target_os = "linux")]
+    pub fn observe_files(
+        &self,
+    ) -> Result<Option<(Vec<std::path::PathBuf>, PlatformRevision)>, LinuxAdapterError> {
+        self.inner.observe_files()
+    }
+    #[cfg(target_os = "linux")]
+    pub fn write_files_if_current(
+        &self,
+        paths: &[std::path::PathBuf],
+        expected: &PlatformRevision,
+    ) -> Result<Option<PlatformRevision>, LinuxAdapterError> {
+        let bytes = file_urls::encode(paths)?;
+        if !self.inner.is_current(expected)? {
+            return Ok(None);
+        }
+        self.inner.write_payload(&bytes, true).map(Some)
+    }
     pub fn connect() -> Result<Self, LinuxAdapterError> {
         platform_wayland::Clipboard::connect().map(|inner| Self { inner })
     }
@@ -576,6 +600,7 @@ mod platform_wayland {
     }
 
     struct WatchState {
+        current_is_file: bool,
         instance: u64,
         generation: u64,
         current_revision: Option<PlatformRevision>,
@@ -589,6 +614,7 @@ mod platform_wayland {
     impl WatchState {
         fn new(instance: u64) -> Self {
             Self {
+                current_is_file: false,
                 instance,
                 generation: 0,
                 current_revision: None,
@@ -611,6 +637,7 @@ mod platform_wayland {
                 self.instance, self.generation
             ));
             self.current_revision = Some(revision.clone());
+            self.current_is_file = mime_types.iter().any(|mime| mime == "text/uri-list");
             self.snapshot = if has_offer {
                 SelectionSnapshot::Pending
             } else {
@@ -635,6 +662,49 @@ mod platform_wayland {
     }
 
     type SharedWatch = Arc<(Mutex<WatchState>, Condvar)>;
+
+    #[cfg(test)]
+    #[test]
+    fn file_offer_is_not_reported_as_a_text_observation() {
+        let shared = Arc::new((Mutex::new(WatchState::new(999)), Condvar::new()));
+        let (_, observations) = std::sync::mpsc::sync_channel(1);
+        let clipboard = Clipboard {
+            shared: shared.clone(),
+            observations,
+        };
+        let (generation, revision) = shared
+            .0
+            .lock()
+            .unwrap()
+            .begin_selection(true, &["text/plain".into(), "text/uri-list".into()]);
+        let observation = LocalObservation {
+            bytes: b"file:///tmp/a%20file.bin\r\n".to_vec(),
+            revision: revision.clone(),
+            hint: clipmesh_agent_core::HintClassification::Ordinary,
+        };
+        assert!(publish_ready(&shared, generation, &observation));
+        assert!(clipboard.observe_text().unwrap().is_none());
+        assert_eq!(
+            clipboard.observe_files().unwrap().unwrap(),
+            (vec![std::path::PathBuf::from("/tmp/a file.bin")], revision)
+        );
+        let (generation, revision) = shared
+            .0
+            .lock()
+            .unwrap()
+            .begin_selection(true, &["text/plain".into()]);
+        let plain = LocalObservation {
+            bytes: b"file:///tmp/a%20file.bin".to_vec(),
+            revision,
+            hint: clipmesh_agent_core::HintClassification::Ordinary,
+        };
+        assert!(publish_ready(&shared, generation, &plain));
+        assert!(clipboard.observe_files().unwrap().is_none());
+        assert_eq!(
+            clipboard.observe_text().unwrap().unwrap().bytes,
+            plain.bytes
+        );
+    }
 
     pub(super) struct Clipboard {
         shared: SharedWatch,
@@ -669,6 +739,9 @@ mod platform_wayland {
                 }
                 match &state.snapshot {
                     SelectionSnapshot::Ready(observation) => {
+                        if state.current_is_file {
+                            return Ok(None);
+                        }
                         return Ok(Some(observation.clone()));
                     }
                     SelectionSnapshot::Empty => return Ok(None),
@@ -682,6 +755,45 @@ mod platform_wayland {
                     }
                 }
             }
+        }
+
+        pub(super) fn current_revision(
+            &self,
+        ) -> Result<Option<PlatformRevision>, LinuxAdapterError> {
+            let state = self
+                .shared
+                .0
+                .lock()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            if state.failed {
+                return Err(LinuxAdapterError::AdapterUnavailable);
+            }
+            Ok(state.current_revision.clone())
+        }
+
+        pub(super) fn observe_files(
+            &self,
+        ) -> Result<Option<(Vec<std::path::PathBuf>, PlatformRevision)>, LinuxAdapterError>
+        {
+            let state = self
+                .shared
+                .0
+                .lock()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            if state.failed {
+                return Err(LinuxAdapterError::AdapterUnavailable);
+            }
+            if state.current_is_file {
+                if let SelectionSnapshot::Ready(observation) = &state.snapshot {
+                    if observation.hint == clipmesh_agent_core::HintClassification::Ordinary {
+                        return Ok(Some((
+                            super::file_urls::decode(&observation.bytes)?,
+                            observation.revision.clone(),
+                        )));
+                    }
+                }
+            }
+            Ok(None)
         }
 
         pub(super) fn next_observation(&self) -> Result<LocalObservation, LinuxAdapterError> {
@@ -709,6 +821,14 @@ mod platform_wayland {
             bytes: &[u8],
         ) -> Result<PlatformRevision, LinuxAdapterError> {
             std::str::from_utf8(bytes).map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            self.write_payload(bytes, false)
+        }
+
+        pub(super) fn write_payload(
+            &self,
+            bytes: &[u8],
+            files: bool,
+        ) -> Result<PlatformRevision, LinuxAdapterError> {
             let (mutex, condition) = &*self.shared;
             let (before, write_marker) = {
                 let mut state = mutex
@@ -721,7 +841,11 @@ mod platform_wayland {
                 .copy_multi(vec![
                     MimeSource {
                         source: Source::Bytes(bytes.to_vec().into_boxed_slice()),
-                        mime_type: CopyMimeType::Text,
+                        mime_type: if files {
+                            CopyMimeType::Specific("text/uri-list".into())
+                        } else {
+                            CopyMimeType::Text
+                        },
                     },
                     MimeSource {
                         source: Source::Bytes(Vec::new().into_boxed_slice()),
@@ -748,6 +872,7 @@ mod platform_wayland {
                         SelectionSnapshot::Pending => {}
                         SelectionSnapshot::Ready(observation)
                             if state.current_matches_pending_write
+                                && state.current_is_file == files
                                 && observation.bytes == bytes =>
                         {
                             let revision = observation.revision.clone();
@@ -814,7 +939,13 @@ mod platform_wayland {
             let Some(offer) = offer else {
                 return;
             };
-            let Some(mime_type) = preferred_text_mime(&mime_types) else {
+            let is_file = mime_types.iter().any(|mime| mime == "text/uri-list");
+            let selected_mime = if is_file {
+                Some("text/uri-list".into())
+            } else {
+                preferred_text_mime(&mime_types)
+            };
+            let Some(mime_type) = selected_mime else {
                 publish_empty(&self.shared, generation);
                 self.current_offer = Some(offer);
                 return;
@@ -847,7 +978,7 @@ mod platform_wayland {
                 };
                 match observation {
                     Ok(observation) => {
-                        if publish_ready(&shared, generation, &observation) {
+                        if publish_ready(&shared, generation, &observation) && !is_file {
                             let _ = observations.send(observation);
                         }
                     }
@@ -1077,6 +1208,35 @@ mod platform_wayland {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CLIPMESH_ISOLATED_WAYLAND=1 and a private compositor"]
+    fn native_file_offer_round_trip() {
+        assert_eq!(std::env::var("CLIPMESH_ISOLATED_WAYLAND").unwrap(), "1");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a file #1.bin");
+        std::fs::write(&path, [0, 255, 128]).unwrap();
+        let mut clipboard = WaylandClipboard::connect().unwrap();
+        let before = clipboard.write_text(b"synthetic baseline").unwrap();
+        let applied = clipboard
+            .write_files_if_current(&[path.clone()], &before)
+            .unwrap()
+            .unwrap();
+        assert!(clipboard.observe_text().unwrap().is_none());
+        assert_eq!(
+            clipboard.observe_files().unwrap().unwrap(),
+            (vec![path.clone()], applied.clone())
+        );
+        clipboard.write_text(b"newer local text").unwrap();
+        assert!(clipboard
+            .write_files_if_current(&[path], &applied)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            clipboard.observe_text().unwrap().unwrap().bytes,
+            b"newer local text"
+        );
+    }
     use super::*;
     use std::{collections::VecDeque, io, net::Shutdown, os::unix::net::UnixStream, thread};
     use tempfile::TempDir;

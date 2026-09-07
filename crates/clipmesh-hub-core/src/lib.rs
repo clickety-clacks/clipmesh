@@ -15,6 +15,8 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBeha
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod file_store;
+
 const SCHEMA_VERSION: u32 = 1;
 const HARD_MAX_PAYLOAD_BYTES: usize = 1_048_576;
 const EXPECTED_TABLES: &[&str] = &["clear_receipts", "clips", "hub_meta", "message_tombstones"];

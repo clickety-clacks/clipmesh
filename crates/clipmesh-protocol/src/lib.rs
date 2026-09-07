@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::{Uuid, Variant, Version};
 
+pub mod files;
+
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_CLOCK_SKEW_MS: i64 = 120_000;
 pub const HARD_MAX_PAYLOAD_BYTES: usize = 1_048_576;

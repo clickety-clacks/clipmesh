@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+libc = "0.2"
+sha2 = "0.10"
 clipmesh-agent-core = { path = "../clipmesh-agent-core", version = "0.1.0" }
 clipmesh-protocol = { path = "../clipmesh-protocol", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }

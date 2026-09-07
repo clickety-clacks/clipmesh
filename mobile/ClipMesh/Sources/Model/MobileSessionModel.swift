@@ -9,6 +9,9 @@ final class MobileSessionModel {
     private(set) var errorCode: String?
     private(set) var actionFeedback: String?
     private(set) var pendingPublishID: UUID?
+    private(set) var isSendingFiles = false
+    private(set) var historyResetID = UUID()
+    @ObservationIgnored private var fileClient: FileTransferClient?
     @ObservationIgnored private var publishTask: Task<Void, Never>?
     var hubURLText: String
 
@@ -64,6 +67,8 @@ final class MobileSessionModel {
     }
 
     func deactivate() {
+        fileClient?.close()
+        fileClient = nil
         cancelPublish()
         connectionTask?.cancel()
         connectionTask = nil
@@ -78,6 +83,22 @@ final class MobileSessionModel {
         lifecycleState = .inactive
         errorCode = nil
         preferences.saveConnectionState(.disconnected)
+    }
+
+    func sendFiles(_ selection: [LocalFileSelection]) async {
+        guard canPublish, !isSendingFiles else { return }
+        isSendingFiles = true
+        defer { isSendingFiles = false }
+        let client = FileTransferClient()
+        fileClient = client
+        defer { client.close(); fileClient = nil }
+        do {
+            client.open(try HubEndpoint(hubURLText))
+            try await client.send(selection.map { ($0.descriptor, $0.data) })
+            actionFeedback = "Sent to ClipMesh"
+        } catch {
+            if lifecycleState != .inactive { actionFeedback = "File transfer did not complete" }
+        }
     }
 
     @discardableResult
@@ -95,6 +116,7 @@ final class MobileSessionModel {
     }
 
     func clearLocalHistory() {
+        historyResetID = UUID()
         storedHistory.removeAll()
         updateVisibleHistory()
     }
@@ -112,7 +134,7 @@ final class MobileSessionModel {
         }
         do {
             try pasteboard.write(clip.content)
-            actionFeedback = "Copied to iPhone clipboard"
+            actionFeedback = "Copied to device clipboard"
         } catch {
             transitionToError(ReasonCodeV1.adapterUnavailable.rawValue)
         }
@@ -141,7 +163,7 @@ final class MobileSessionModel {
     func publishClipboardText(_ text: String?) {
         guard canPublish, let clearGeneration else { return }
         guard let text, !text.isEmpty else {
-            actionFeedback = "Copy some text first. ClipMesh currently supports text only."
+            actionFeedback = nil
             return
         }
         do {
@@ -358,6 +380,7 @@ final class MobileSessionModel {
 
         switch value.status {
         case .fresh, .epochChanged, .generationChanged:
+            historyResetID = UUID()
             storedHistory.removeAll()
             processedMessageIDs.removeAll()
             lastCursor = nil
@@ -479,6 +502,7 @@ final class MobileSessionModel {
         }
         clearGeneration = value.clearGeneration
         lastCursor = value.clearedThroughCursor
+        historyResetID = UUID()
         storedHistory.removeAll()
         processedMessageIDs.removeAll()
         pendingAcknowledgement = nil

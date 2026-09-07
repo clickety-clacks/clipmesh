@@ -360,6 +360,17 @@ impl AgentCore {
         self.take_ack(now_ms, true)
     }
 
+    pub fn allow_file_observation(&mut self) -> bool {
+        if self.state() != AgentState::ActiveUnlockedLive {
+            return false;
+        }
+        if self.local_only_next {
+            self.local_only_next = false;
+            return false;
+        }
+        true
+    }
+
     pub fn disconnect(&mut self) {
         self.session = None;
         self.pending_ack = None;

@@ -16,6 +16,29 @@ const NOW: i64 = 1_700_000_000_000;
 const LOCAL_PEER: &str = "peer-local-synthetic";
 const REMOTE_PEER: &str = "peer-remote-synthetic";
 
+#[test]
+fn file_observations_obey_live_lock_pause_and_local_only_controls() {
+    let (_fixture, path) = state_path();
+    let (mut agent, _) = live_agent(&path);
+    assert!(agent.allow_file_observation());
+    agent.local_control(LocalControl::LocalOnlyNext).unwrap();
+    assert!(!agent.allow_file_observation());
+    assert!(agent.allow_file_observation());
+    agent.set_locked(true);
+    assert!(!agent.allow_file_observation());
+    agent.set_locked(false);
+    assert!(
+        !agent.allow_file_observation(),
+        "unlock still requires reconnect and resume"
+    );
+    agent.disconnect();
+    assert!(!agent.allow_file_observation());
+    let (_paused_fixture, paused_path) = state_path();
+    let (mut paused, _) = live_agent(&paused_path);
+    paused.local_control(LocalControl::Pause).unwrap();
+    assert!(!paused.allow_file_observation());
+}
+
 #[derive(Default)]
 struct SyntheticClipboard {
     current_revision: Option<PlatformRevision>,

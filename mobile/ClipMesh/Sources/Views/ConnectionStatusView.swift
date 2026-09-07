@@ -6,22 +6,18 @@ struct ConnectionStatusView: View {
 
     var body: some View {
         Label(title, systemImage: symbol)
+            .labelStyle(.titleAndIcon)
+            .fixedSize()
             .font(.footnote)
             .foregroundStyle(state == .foregroundError ? .red : .secondary)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.bar)
     }
 
     private var title: String {
         switch state {
         case .foregroundConnecting:
-            "Connecting and catching up"
+            "Connecting"
         case .foregroundError:
-            errorCode == ReasonCodeV1.configMissingRequired.rawValue
-                ? "Set your ClipMesh hub in Settings to connect."
-                : "Could not connect. Check Settings or tap Refresh."
+            "Offline"
         case .foregroundLive:
             "Live"
         case .inactive:

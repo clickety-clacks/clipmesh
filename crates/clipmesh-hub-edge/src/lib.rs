@@ -28,6 +28,7 @@ use thiserror::Error;
 use uuid::{Uuid, Variant, Version};
 
 const PROTOCOL: &str = "clipmesh.v1";
+use clipmesh_protocol::files::{FileRequest, FILE_WEBSOCKET_PROTOCOL, MAX_FILE_MESSAGE_BYTES};
 const MAX_HEADERS: usize = 16_384;
 
 const SYSTEM_LOCALAPI_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
@@ -635,6 +636,7 @@ struct Sessions {
 }
 
 struct EdgeSession {
+    files: bool,
     peer_id: StablePeerId,
     opened_at_ms: i64,
     last_activity_ms: i64,
@@ -810,6 +812,7 @@ impl WebSocketConnection {
 }
 
 pub struct HubEdge {
+    files: Mutex<clipmesh_hub_core::file_store::FileStore>,
     config: EdgeConfig,
     local_api: SystemLocalApi,
     core: HubCore,
@@ -869,9 +872,17 @@ impl HubEdge {
             history_max_entries: config.history_max_entries,
             max_payload_bytes: config.max_payload_bytes,
         };
+        let file_database = database.as_ref().with_extension("files.sqlite");
         let core =
             HubCore::open(database, limits).map_err(|error| EdgeFailure(core_error(error)))?;
+        let mut files =
+            clipmesh_hub_core::file_store::FileStore::open(&file_database, 1024 * 1024 * 1024)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+        files
+            .sync_generation(core.clear_generation())
+            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
         Ok(Self {
+            files: Mutex::new(files),
             config,
             local_api,
             core,
@@ -953,6 +964,10 @@ impl HubEdge {
         sessions.entries.insert(
             hello.session_id,
             EdgeSession {
+                files: request.headers.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("sec-websocket-protocol")
+                        && value == FILE_WEBSOCKET_PROTOCOL
+                }),
                 peer_id: admitted.peer_id,
                 opened_at_ms: 0,
                 last_activity_ms: 0,
@@ -1033,12 +1048,30 @@ impl HubEdge {
             .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-key"))
             .map(|(_, value)| value.as_str())
             .ok_or(EdgeFailure(EdgeError::ProtocolSchemaInvalid))?;
-        write_upgrade_response(&mut stream, key)
-            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+        let files = self
+            .sessions
+            .lock()
+            .expect("edge sessions lock poisoned")
+            .entries
+            .get(&session.id)
+            .expect("session just inserted")
+            .files;
+        write_upgrade_response(
+            &mut stream,
+            key,
+            if files {
+                FILE_WEBSOCKET_PROTOCOL
+            } else {
+                PROTOCOL
+            },
+        )
+        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
         let mut websocket = WebSocketConnection::from_upgraded(stream);
-        websocket
-            .write_complete_text(&self.server_hello(session, now_ms)?)
-            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+        if !files {
+            websocket
+                .write_complete_text(&self.server_hello(session, now_ms)?)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+        }
         let mut sessions = self.sessions.lock().expect("edge sessions lock poisoned");
         let entry = sessions
             .entries
@@ -1047,6 +1080,9 @@ impl HubEdge {
         entry.opened_at_ms = now_ms;
         entry.last_activity_ms = now_ms;
         entry.last_pong_ms = now_ms;
+        if files {
+            entry.awaiting_resume = false;
+        }
         drop(sessions);
         cleanup.disarm();
         Ok(ServedConnection::Upgraded { session, websocket })
@@ -1297,13 +1333,20 @@ impl HubEdge {
             .get_mut(&session_id)
             .ok_or(EdgeFailure(EdgeError::SessionContextStale))?;
         let elapsed_ms = now_ms.saturating_sub(session.message_window_started_ms);
-        let message_refill = (elapsed_ms.saturating_mul(120) / 60_000) as u32;
+        // File messages carry bounded chunks, not independent clipboard
+        // publications. Permit 16 MiB/s while retaining the publish bucket.
+        let (per_minute, burst) = if session.files {
+            (3840, 128)
+        } else {
+            (120, 20)
+        };
+        let message_refill = (elapsed_ms.saturating_mul(per_minute) / 60_000) as u32;
         if message_refill > 0 {
             session.message_window_started_ms = now_ms;
             session.message_tokens = session
                 .message_tokens
                 .saturating_add(message_refill)
-                .min(20);
+                .min(burst);
         }
         if session.message_tokens == 0 {
             return Err(EdgeFailure(EdgeError::MessageRateLimited));
@@ -1462,6 +1505,8 @@ impl HubEdge {
         let input: ClearInput = serde_json::from_str(text)
             .map_err(|_| EdgeFailure(EdgeError::ProtocolSchemaInvalid))?;
         require_version(input.protocol_version)?;
+        // Serialize clear with file responses, including their socket writes.
+        let mut files = self.files.lock().expect("file store lock poisoned");
         self.core
             .clear_history(
                 session_id,
@@ -1469,7 +1514,10 @@ impl HubEdge {
                 parse_u64(input.expected_clear_generation)?,
             )
             .map(|_: ClearAccepted| ())
-            .map_err(|error| EdgeFailure(core_error(error)))
+            .map_err(|error| EdgeFailure(core_error(error)))?;
+        files
+            .sync_generation(self.core.clear_generation())
+            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))
     }
 }
 
@@ -1503,6 +1551,12 @@ impl HubListener {
         while keep_running() {
             if last_probe.elapsed() >= probe_interval {
                 self.edge.poll_localapi();
+                self.edge
+                    .files
+                    .lock()
+                    .expect("file store lock poisoned")
+                    .expire(unix_ms()?)
+                    .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
                 last_probe = Instant::now();
             }
             match self.listener.accept() {
@@ -1545,6 +1599,14 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
         return Ok(());
     };
     let _cleanup = SessionCleanupGuard::new(edge, session);
+    let files = edge
+        .sessions
+        .lock()
+        .expect("edge sessions lock poisoned")
+        .entries
+        .get(&session.id)
+        .expect("session just inserted")
+        .files;
     websocket
         .stream
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1567,7 +1629,7 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
                 return close_with(edge, session, &mut websocket, error, None);
             }
         }
-        loop {
+        while !files {
             match edge.write_next_event(session, &mut websocket) {
                 Ok(true) => {
                     last_outbound = Instant::now();
@@ -1595,8 +1657,59 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
                 None,
             );
         }
-        match websocket.read_complete_frame(edge.config.maximum_message_bytes()) {
+        match websocket.read_complete_frame(if files {
+            MAX_FILE_MESSAGE_BYTES
+        } else {
+            edge.config.maximum_message_bytes()
+        }) {
             Ok(InboundFrame::Text(text)) => {
+                if files {
+                    edge.require_ready()?;
+                    let request = FileRequest::decode(text.as_bytes())
+                        .map_err(|_| EdgeFailure(EdgeError::ProtocolSchemaInvalid))?;
+                    if let Err(EdgeFailure(error)) = edge.consume_message_token(
+                        session.id,
+                        now_ms,
+                        matches!(request, FileRequest::Publish { .. }),
+                    ) {
+                        if !matches!(
+                            error,
+                            EdgeError::MessageRateLimited | EdgeError::PublishRateLimited
+                        ) {
+                            return Err(EdgeFailure(error));
+                        }
+                        // Rejected before dispatch: retrying this exact request
+                        // cannot duplicate a begin or publish operation.
+                        let request_value: Value = serde_json::from_str(&text)
+                            .map_err(|_| EdgeFailure(EdgeError::ProtocolSchemaInvalid))?;
+                        websocket
+                            .write_complete_text(
+                                &json!({"type":"rejected",
+                            "request_id":request_value["request_id"], "code":"rate_limited"})
+                                .to_string(),
+                            )
+                            .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                        last_outbound = Instant::now();
+                        continue;
+                    }
+                    let peer = edge.session_peer(session.id)?;
+                    let expires = now_ms.saturating_add(
+                        (edge.config.retention_seconds as i64).saturating_mul(1000),
+                    );
+                    let mut file_store = edge.files.lock().expect("file store lock poisoned");
+                    file_store
+                        .sync_generation(edge.core.clear_generation())
+                        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                    let reply =
+                        file_store.handle(peer.as_boundary_value(), request, now_ms, expires);
+                    let encoded = serde_json::to_string(&reply)
+                        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                    websocket
+                        .write_complete_text(&encoded)
+                        .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                    last_outbound = Instant::now();
+                    continue;
+                }
                 if let Err(EdgeFailure(error)) = edge.handle_text(session, &text, now_ms) {
                     websocket
                         .write_complete_text(&websocket_failure_frame(Some(&text), error))
@@ -1762,7 +1875,9 @@ fn validate_http(request: &HttpRequest) -> Option<HttpResponse> {
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
         .collect();
-    if protocols.len() != 1 || protocols[0].1 != PROTOCOL {
+    if protocols.len() != 1
+        || (protocols[0].1 != PROTOCOL && protocols[0].1 != FILE_WEBSOCKET_PROTOCOL)
+    {
         return Some(HttpResponse::error(
             400,
             EdgeError::ProtocolVersionUnsupported,
@@ -1864,14 +1979,18 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> std::
     stream.flush()
 }
 
-fn write_upgrade_response(stream: &mut TcpStream, key: &str) -> std::io::Result<()> {
+fn write_upgrade_response(
+    stream: &mut TcpStream,
+    key: &str,
+    protocol: &str,
+) -> std::io::Result<()> {
     let mut digest = Sha1::new();
     digest.update(key.as_bytes());
     digest.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
     let accept = STANDARD.encode(digest.finalize());
     write!(
         stream,
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Protocol: {PROTOCOL}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Protocol: {protocol}\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     )?;
     stream.flush()
 }
@@ -2320,6 +2439,63 @@ mod tests {
         client
     }
 
+    #[test]
+    fn file_channel_negotiates_and_serves_history_over_a_real_socket() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let edge = Arc::new(
+            HubEdge::prepare(
+                configured,
+                daemon.client(),
+                directory.path().join("hub.sqlite"),
+            )
+            .unwrap(),
+        );
+        let server_edge = Arc::clone(&edge);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_socket(&server_edge, stream)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"GET /v1/stream HTTP/1.1\r\nHost: simulator\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: clipmesh.files.v1\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 101"));
+        assert!(response.contains("Sec-WebSocket-Protocol: clipmesh.files.v1"));
+        client
+            .write_all(&masked_text_frame(
+                r#"{"type":"history","request_id":"00000000-0000-4000-8000-000000000001"}"#,
+            ))
+            .unwrap();
+        let mut header = [0; 2];
+        client.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 0x81);
+        assert!(header[1] < 126);
+        let mut payload = vec![0; header[1] as usize];
+        client.read_exact(&mut payload).unwrap();
+        let reply: clipmesh_protocol::files::FileReply = serde_json::from_slice(&payload).unwrap();
+        assert!(
+            matches!(reply,clipmesh_protocol::files::FileReply::History {clips,..} if clips.is_empty())
+        );
+        drop(client);
+        assert!(server.join().unwrap().is_ok());
+        assert!(edge.sessions.lock().unwrap().entries.is_empty());
+    }
+
     fn live(edge: &HubEdge) -> SessionHandle {
         let session = session(edge);
         edge.handle_text(session, r#"{"protocol_version":1,"type":"resume","known_history_epoch":null,"known_clear_generation":null,"after_cursor":null}"#, NOW).unwrap();
@@ -2697,6 +2873,38 @@ mod tests {
     }
 
     #[test]
+    fn file_chunks_have_a_bounded_bucket_separate_from_text() {
+        let (_directory, _daemon, edge) = edge();
+        let file = session(&edge);
+        edge.sessions
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&file.id)
+            .unwrap()
+            .files = true;
+        for _ in 0..128 {
+            edge.consume_message_token(file.id, NOW, false).unwrap();
+        }
+        assert!(matches!(
+            edge.consume_message_token(file.id, NOW, false),
+            Err(EdgeFailure(EdgeError::MessageRateLimited))
+        ));
+        for _ in 0..64 {
+            edge.consume_message_token(file.id, NOW + 1000, false)
+                .unwrap();
+        }
+        assert!(edge
+            .consume_message_token(file.id, NOW + 1000, false)
+            .is_err());
+        let text = session(&edge);
+        for _ in 0..20 {
+            edge.consume_message_token(text.id, NOW, false).unwrap();
+        }
+        assert!(edge.consume_message_token(text.id, NOW, false).is_err());
+    }
+
+    #[test]
     fn peer_connection_and_http_buckets_refill_at_the_specified_rates() {
         let (_directory, _daemon, edge) = edge();
         let peer = StablePeerId::from_boundary("peer-reserved-example".to_owned()).unwrap();
@@ -2736,7 +2944,10 @@ mod tests {
         client
             .write_all(b"GET /v1/stream HTTP/1.1\r\nHost: simulator\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: clipmesh.v1\r\n\r\n")
             .unwrap();
-        client.shutdown(std::net::Shutdown::Write).unwrap();
+        // Rejection may close the socket before the client half-closes it.
+        if let Err(error) = client.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        }
         let mut response = Vec::new();
         let _ = client.read_to_end(&mut response);
         assert!(matches!(

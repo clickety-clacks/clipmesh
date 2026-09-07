@@ -3,12 +3,31 @@
 ClipMesh is a small, private, cross-platform clipboard mesh designed for
 machines already connected by a trusted overlay network such as Tailscale.
 
-The project is intentionally text-first and topology-neutral. Desktop agents
-automatically exchange clipboard text through a hub, while the iOS/iPadOS app
-leaves the system clipboard untouched when opened or when clips arrive.
-Tap **Copy to ClipMesh** to send clipboard text. Tap the latest clip preview
-or a history entry to copy it to the device. Sending reports success only
-after the hub accepts the clip. iOS may ask permission to paste when sending.
+Desktop agents automatically exchange clipboard text and native file selections
+through a hub. macOS reads file URLs from the pasteboard; Linux reads explicit
+Wayland `text/uri-list` offers. A path copied as ordinary text remains text. The
+iOS/iPadOS app supports text and file selections. Its first row previews the
+device clipboard with an inverted background and a Send action. Opening the
+app reads that preview but does not send anything or write to the clipboard.
+iOS may request paste permission while preparing the preview.
+
+Tap Send to publish the displayed content. The paperclip menu also lets you
+choose files. Received files offer Copy and Share, and image/video files show
+thumbnails after download. Tapping a downloaded thumbnail copies the selection.
+Sending reports success only after the hub accepts the whole selection.
+The app uses a scrolling SwiftUI List with native floating toolbars.
+
+File transfer currently supports up to 32 files per clipping, 100 MiB per file,
+and 500 MiB per selection. The hub reserves at most 1 GiB of file payloads;
+the mobile download cache is limited to 500 MiB. Directories are not accepted.
+Files travel as bytes with SHA-256 verification, never as remote filesystem
+paths. File metadata and transfers use the negotiated `clipmesh.files.v1`
+connection alongside the existing text protocol. Desktop receivers skip initial
+file history, suppress source echoes, and check clipboard revisions before
+applying downloaded files. Received bytes live in private local directories.
+Direct image clipboard formats on desktop are not yet converted into files;
+copy an image file in the file manager instead. These source capabilities do
+not establish what is installed on any machine.
 
 Rust is the default implementation language for the hub, protocol, and desktop
 agents. The Apple mobile client uses SwiftUI and native platform APIs.

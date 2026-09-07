@@ -246,12 +246,15 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "clipmesh-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clipmesh-agent-core",
  "clipmesh-agent-linux",
  "clipmesh-agent-macos",
  "clipmesh-protocol",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
@@ -311,8 +314,11 @@ dependencies = [
 name = "clipmesh-hub-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clipmesh-protocol",
  "rusqlite",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "uuid",
@@ -324,6 +330,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clipmesh-hub-core",
+ "clipmesh-protocol",
  "rusqlite",
  "serde",
  "serde_json",

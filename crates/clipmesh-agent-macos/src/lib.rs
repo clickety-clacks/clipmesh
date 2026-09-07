@@ -416,6 +416,46 @@ pub struct MacPasteboard {
 }
 
 impl MacPasteboard {
+    pub fn current_revision(&self) -> Result<PlatformRevision, MacAdapterError> {
+        Ok(self.inner.read_snapshot()?.revision)
+    }
+    /// Reject a downloaded selection if the clipboard changed while it was
+    /// in flight. NSPasteboard has no atomic compare-and-swap operation, so
+    /// callers must also keep their own clipboard work on one thread.
+    pub fn write_files_if_current(
+        &self,
+        paths: &[std::path::PathBuf],
+        expected: &PlatformRevision,
+    ) -> Result<Option<PlatformRevision>, MacAdapterError> {
+        if !self.inner.is_current(expected)? {
+            return Ok(None);
+        }
+        self.inner.write_file_paths(paths).map(Some)
+    }
+
+    pub fn write_files(
+        &self,
+        paths: &[std::path::PathBuf],
+    ) -> Result<PlatformRevision, MacAdapterError> {
+        self.inner.write_file_paths(paths)
+    }
+    pub fn observe_files(
+        &self,
+    ) -> Result<Option<(Vec<std::path::PathBuf>, PlatformRevision)>, MacAdapterError> {
+        let snapshot = self.inner.read_snapshot()?;
+        if classify_declared_types(&snapshot.declared_types)? != HintClassification::Ordinary {
+            return Ok(None);
+        }
+        let paths = self.inner.read_file_paths()?;
+        if !self.inner.is_current(&snapshot.revision)? {
+            return Err(MacAdapterError::AdapterUnavailable);
+        }
+        if paths.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((paths, snapshot.revision)))
+        }
+    }
     pub fn general() -> Result<Self, MacAdapterError> {
         platform::Pasteboard::general().map(|inner| Self { inner })
     }
@@ -481,9 +521,11 @@ mod platform {
         string::CFString,
     };
     use core_foundation_sys::dictionary::CFDictionaryRef;
-    use objc2::rc::Retained;
-    use objc2_app_kit::{NSPasteboard, NSPasteboardType, NSPasteboardTypeString};
-    use objc2_foundation::{NSArray, NSString};
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use objc2_app_kit::{
+        NSPasteboard, NSPasteboardType, NSPasteboardTypeString, NSPasteboardWriting,
+    };
+    use objc2_foundation::{NSArray, NSString, NSURL};
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -502,6 +544,54 @@ mod platform {
     }
 
     impl Pasteboard {
+        pub(super) fn write_file_paths(
+            &self,
+            paths: &[std::path::PathBuf],
+        ) -> Result<PlatformRevision, MacAdapterError> {
+            if paths.is_empty() || paths.len() > 32 {
+                return Err(MacAdapterError::AdapterUnavailable);
+            }
+            let mut urls = Vec::new();
+            for path in paths {
+                if !path.is_absolute() || !path.is_file() {
+                    return Err(MacAdapterError::AdapterUnavailable);
+                }
+                let path = path.to_str().ok_or(MacAdapterError::AdapterUnavailable)?;
+                urls.push(NSURL::fileURLWithPath(&NSString::from_str(path)));
+            }
+            let objects: Vec<&ProtocolObject<dyn NSPasteboardWriting>> = urls
+                .iter()
+                .map(|url| ProtocolObject::from_ref(&**url))
+                .collect();
+            let objects = NSArray::from_slice(&objects);
+            self.pasteboard.clearContents();
+            if !self.pasteboard.writeObjects(&objects) {
+                return Err(MacAdapterError::AdapterUnavailable);
+            }
+            revision(self.pasteboard.changeCount())
+        }
+        pub(super) fn read_file_paths(&self) -> Result<Vec<std::path::PathBuf>, MacAdapterError> {
+            let Some(items) = self.pasteboard.pasteboardItems() else {
+                return Ok(Vec::new());
+            };
+            if items.len() > 32 {
+                return Err(MacAdapterError::AdapterUnavailable);
+            }
+            let file_type = NSString::from_str("public.file-url");
+            let mut paths = Vec::new();
+            for item in items.to_vec() {
+                if let Some(value) = item.stringForType(&file_type) {
+                    let url =
+                        NSURL::URLWithString(&value).ok_or(MacAdapterError::AdapterUnavailable)?;
+                    if !url.isFileURL() {
+                        return Err(MacAdapterError::AdapterUnavailable);
+                    }
+                    let path = url.path().ok_or(MacAdapterError::AdapterUnavailable)?;
+                    paths.push(std::path::PathBuf::from(path.to_string()));
+                }
+            }
+            Ok(paths)
+        }
         pub(super) fn general() -> Result<Self, MacAdapterError> {
             Ok(Self {
                 pasteboard: NSPasteboard::generalPasteboard(),
@@ -667,6 +757,15 @@ mod platform {
     pub(super) struct Pasteboard;
 
     impl Pasteboard {
+        pub(super) fn write_file_paths(
+            &self,
+            _paths: &[std::path::PathBuf],
+        ) -> Result<PlatformRevision, MacAdapterError> {
+            Err(MacAdapterError::AdapterUnavailable)
+        }
+        pub(super) fn read_file_paths(&self) -> Result<Vec<std::path::PathBuf>, MacAdapterError> {
+            Err(MacAdapterError::AdapterUnavailable)
+        }
         pub(super) fn general() -> Result<Self, MacAdapterError> {
             Err(MacAdapterError::AdapterUnavailable)
         }
@@ -694,6 +793,49 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn isolated_file_clipboard_round_trip_preserves_paths_and_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("a file #1.bin");
+        std::fs::write(&path, [0, 255, 128]).unwrap();
+        let pasteboard = super::MacPasteboard::unique_for_capture().unwrap();
+        let revision = pasteboard.write_files(&[path.clone()]).unwrap();
+        let (paths, observed) = pasteboard.observe_files().unwrap().unwrap();
+        assert_eq!(paths, vec![path]);
+        assert_eq!(observed, revision);
+        assert!(pasteboard.observe_text().unwrap().is_none());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn downloaded_files_do_not_replace_a_newer_clipboard_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.bin");
+        let newer = directory.path().join("newer.bin");
+        let incoming = directory.path().join("incoming.bin");
+        for path in [&original, &newer, &incoming] {
+            std::fs::write(path, [0, 255]).unwrap();
+        }
+        let pasteboard = super::MacPasteboard::unique_for_capture().unwrap();
+        let captured = pasteboard.write_files(&[original]).unwrap();
+        let current = pasteboard.write_files(&[newer.clone()]).unwrap();
+        assert!(pasteboard
+            .write_files_if_current(&[incoming.clone()], &captured)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            pasteboard.observe_files().unwrap().unwrap(),
+            (vec![newer], current.clone())
+        );
+        let applied = pasteboard
+            .write_files_if_current(&[incoming.clone()], &current)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pasteboard.observe_files().unwrap().unwrap(),
+            (vec![incoming], applied)
+        );
+    }
     use super::*;
     use std::{collections::VecDeque, io, net::Shutdown, os::unix::net::UnixStream, thread};
     use tempfile::TempDir;

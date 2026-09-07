@@ -4,6 +4,8 @@
 //! network are opened. The transport sends only the accepted protocol schema;
 //! it has no application identity, enrollment, or credential field.
 
+pub mod files;
+
 use std::{
     io,
     net::{IpAddr, SocketAddr, TcpStream},
