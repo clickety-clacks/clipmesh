@@ -193,6 +193,9 @@ fn run_desktop<D: Desktop>(
             });
             match connection {
                 Ok(connection) => {
+                    // Files copied before startup, unlock, or reconnection
+                    // are a baseline, not fresh publish intent.
+                    last_file_revision = desktop.file_revision()?;
                     backoff.entered_live(now_ms);
                     transport = Some(connection);
                 }
