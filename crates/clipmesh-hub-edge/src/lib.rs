@@ -1584,6 +1584,7 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
                 .write_ping()
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
             ping_sent = Some(Instant::now());
+            last_outbound = Instant::now();
         }
         if ping_sent.is_some_and(|at| at.elapsed() >= Duration::from_secs(10)) {
             return close_with(

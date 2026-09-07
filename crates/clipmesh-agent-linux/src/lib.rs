@@ -179,8 +179,19 @@ impl OwnerControlSocket {
         {
             return Err(LinuxAdapterError::StatePathInsecure);
         }
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(LinuxAdapterError::StatePathInsecure);
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != owner_uid
+                || metadata.permissions().mode() & 0o777 != 0o600
+            {
+                return Err(LinuxAdapterError::StatePathInsecure);
+            }
+            match UnixStream::connect(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    fs::remove_file(path).map_err(|_| LinuxAdapterError::LocalStateUnavailable)?;
+                }
+                _ => return Err(LinuxAdapterError::StatePathInsecure),
+            }
         }
 
         let listener =
@@ -444,6 +455,27 @@ mod platform_lock {
                 .ok()?;
                 let session_path = manager
                     .call::<_, _, OwnedObjectPath>("GetSessionByPID", &(std::process::id(),))
+                    .or_else(|original| {
+                        // User services are outside the graphical session's process tree.
+                        // Accept its imported session ID only after checking owner and type.
+                        let Ok(id) = std::env::var("XDG_SESSION_ID") else {
+                            return Err(original);
+                        };
+                        let path: OwnedObjectPath = manager.call("GetSession", &(id,))?;
+                        let session = Proxy::new(
+                            &connection,
+                            "org.freedesktop.login1",
+                            path.as_str(),
+                            "org.freedesktop.login1.Session",
+                        )?;
+                        let (uid, _): (u32, OwnedObjectPath) = session.get_property("User")?;
+                        let kind: String = session.get_property("Type")?;
+                        if uid != unsafe { libc::geteuid() } || kind != "wayland" {
+                            return Err(original);
+                        }
+                        drop(session);
+                        Ok(path)
+                    })
                     .ok()?;
                 Some((connection, session_path))
             })();
@@ -1159,6 +1191,19 @@ mod tests {
             read_control_command(&mut reader),
             Err(LinuxAdapterError::ControlRequestInvalid)
         );
+    }
+
+    #[test]
+    fn abandoned_socket_is_recovered_but_live_socket_is_preserved() {
+        let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("control.sock");
+        let abandoned = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(abandoned);
+        let _server = OwnerControlSocket::bind(&path).unwrap();
+        assert!(OwnerControlSocket::bind(&path).is_err());
+        assert!(path.exists());
     }
 
     #[test]
