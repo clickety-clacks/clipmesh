@@ -610,8 +610,23 @@ impl HubCore {
             .sessions
             .get(&session_id)
             .ok_or(CoreError::Failure(FailureCode::SessionContextStale))?;
-        let wire_upper_bound_bytes = session
+        // History replay is bounded by retention, not by the live backlog
+        // budget. Otherwise a fresh client is rejected before it can read its
+        // first event once retained history exceeds that budget. Concurrent
+        // live arrivals buffered during replay still count as backlog.
+        let backlog: Vec<_> = session
             .queue
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    SessionEvent::ResumeStarted(_)
+                        | SessionEvent::ResumeClip(_)
+                        | SessionEvent::ResumeComplete(_)
+                )
+            })
+            .collect();
+        let wire_upper_bound_bytes: usize = backlog
             .iter()
             .map(|event| match event {
                 SessionEvent::ResumeClip(clip) | SessionEvent::Live(clip) => {
@@ -621,8 +636,13 @@ impl HubCore {
             })
             .sum();
         Ok(SessionQueueMetrics {
-            events: session.queue.len(),
-            wire_upper_bound_bytes,
+            events: backlog.len() + session.buffered.len(),
+            wire_upper_bound_bytes: wire_upper_bound_bytes
+                + session
+                    .buffered
+                    .iter()
+                    .map(|clip| 4096 + 4 * clip.content.as_storage_blob().len().div_ceil(3))
+                    .sum::<usize>(),
         })
     }
 

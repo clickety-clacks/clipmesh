@@ -3245,6 +3245,44 @@ mod tests {
     }
 
     #[test]
+    fn retained_history_does_not_trip_live_backlog_limit() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        let mut limits = config();
+        limits.outbound_queue_messages = 2;
+        let edge =
+            HubEdge::prepare(limits, daemon.client(), directory.path().join("hub.sqlite")).unwrap();
+        let source = live(&edge);
+        let publish = |id: usize| {
+            format!(
+                r#"{{"protocol_version":1,"type":"publish","event":{{"message_id":"00000000-0000-4000-8000-{id:012}","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}}}"#
+            )
+        };
+        for id in 1..=4 {
+            edge.handle_text(source, &publish(id), NOW).unwrap();
+            drain(&edge, source);
+        }
+        let target = session(&edge);
+        edge.handle_text(target, r#"{"protocol_version":1,"type":"resume","known_history_epoch":null,"known_clear_generation":null,"after_cursor":null}"#, NOW).unwrap();
+        assert_eq!(edge.take_terminal_error(target).unwrap(), None);
+        assert_eq!(drain(&edge, target).len(), 6);
+        assert_eq!(edge.take_terminal_error(target).unwrap(), None);
+        edge.close_session(target).unwrap();
+
+        // Replay must not exempt newly arriving live traffic from protection.
+        let target = session(&edge);
+        edge.handle_text(target, r#"{"protocol_version":1,"type":"resume","known_history_epoch":null,"known_clear_generation":null,"after_cursor":null}"#, NOW).unwrap();
+        for id in 5..=7 {
+            edge.handle_text(source, &publish(id), NOW).unwrap();
+            drain(&edge, source);
+        }
+        assert_eq!(
+            edge.take_terminal_error(target).unwrap(),
+            Some(EdgeError::SlowConsumer)
+        );
+    }
+
+    #[test]
     fn outbound_queue_limit_closes_the_slow_consumer() {
         let directory = tempdir().unwrap();
         let daemon = LocalApiSimulator::admitted();
