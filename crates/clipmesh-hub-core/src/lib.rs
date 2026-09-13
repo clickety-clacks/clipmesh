@@ -757,6 +757,29 @@ impl HubCore {
         )
     }
 
+    /// Returns source identities represented by currently retained text
+    /// history without requiring a live session. The edge uses this to avoid
+    /// exposing unrelated Tailnet peers in its source metadata response.
+    pub fn retained_source_peer_ids(&self, now_ms: i64) -> Result<Vec<StablePeerId>, CoreError> {
+        let mut state = self.state.lock().expect("hub state lock poisoned");
+        apply_retention(&mut state, self.limits, now_ms)?;
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT DISTINCT source_peer_id FROM clips WHERE expires_at_ms>?1 ORDER BY source_peer_id",
+            )
+            .map_err(|_| CoreError::Failure(FailureCode::StorageUnavailable))?;
+        let rows = statement
+            .query_map([now_ms], |row| row.get::<_, String>(0))
+            .map_err(|_| CoreError::Failure(FailureCode::StorageUnavailable))?;
+        rows.map(|row| {
+            let id = row.map_err(|_| CoreError::Failure(FailureCode::DatabaseIntegrityFailed))?;
+            StablePeerId::from_boundary(id)
+                .map_err(|_| CoreError::Failure(FailureCode::DatabaseIntegrityFailed))
+        })
+        .collect()
+    }
+
     /// Runs the retention work that the hub scheduler invokes every 60 seconds while ready.
     pub fn run_periodic_retention(&self, now_ms: i64) -> Result<(), CoreError> {
         let mut state = self.state.lock().expect("hub state lock poisoned");

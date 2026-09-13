@@ -39,6 +39,15 @@ pub struct PublishedFiles {
     pub manifest: FileManifest,
 }
 
+/// File history metadata with the admitted source identity. This projection
+/// is for additive metadata APIs. The strict `clipmesh.files.v1` reply keeps
+/// using [`PublishedFiles`] and does not gain a field.
+#[derive(Clone, Debug)]
+pub struct PublishedFilesWithSource {
+    pub clip_id: Uuid,
+    pub source_peer_id: String,
+}
+
 impl FileStore {
     /// Dispatch validated transfer messages for a transport-admitted mesh peer.
     /// Admission and connection lifecycle remain the transport's responsibility.
@@ -522,6 +531,33 @@ impl FileStore {
         })
         .collect()
     }
+
+    /// Returns retained file metadata and the source identity recorded at
+    /// publication. It shares the same expiry and 500-entry bound as the
+    /// deployed file history protocol, without changing that protocol's
+    /// response schema.
+    pub fn history_with_sources(
+        &self,
+        now: i64,
+    ) -> Result<Vec<PublishedFilesWithSource>, TransferError> {
+        let mut stmt = self.db.prepare(
+            "SELECT id,peer FROM file_clips WHERE expires>?1 ORDER BY accepted DESC,id DESC LIMIT 500",
+        )?;
+        let rows = stmt.query_map([now], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, source_peer_id) = row?;
+            if source_peer_id.is_empty() {
+                return Err(TransferError::Storage);
+            }
+            Ok(PublishedFilesWithSource {
+                clip_id: Uuid::parse_str(&id).map_err(|_| TransferError::Storage)?,
+                source_peer_id,
+            })
+        })
+        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +782,10 @@ mod tests {
             .publish("sender", clip, &manifest, &[b, a], 3, 100)
             .is_err());
         assert_eq!(store.history(3).unwrap().len(), 1);
+        assert_eq!(
+            store.history_with_sources(3).unwrap()[0].source_peer_id,
+            "sender"
+        );
         drop(store);
         let mut store = FileStore::open(&path, 1024).unwrap();
         assert_eq!(store.history(11).unwrap()[0].manifest, manifest);

@@ -6,7 +6,7 @@
 //! and obtains WhoIs before it reads one HTTP byte.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     os::unix::net::UnixStream,
@@ -34,6 +34,9 @@ const MAX_HEADERS: usize = 16_384;
 const SYSTEM_LOCALAPI_SOCKET: &str = "/var/run/tailscale/tailscaled.sock";
 const LOCALAPI_HOST: &str = "local-tailscaled.sock";
 const LOCALAPI_RESPONSE_LIMIT: usize = 131_072;
+const PEER_DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(30);
+const PEER_DIRECTORY_FAILURE_TTL: Duration = Duration::from_secs(5);
+const MAX_PEER_DIRECTORY_ENTRIES: usize = 1_024;
 
 /// The upstream LocalAPI response contract that this adapter supports.
 ///
@@ -71,6 +74,96 @@ impl SystemLocalApi {
     }
 
     fn self_addresses(&self) -> Result<Vec<IpAddr>, LocalApiError> {
+        let value = self.status()?;
+        let addresses = value
+            .get("TailscaleIPs")
+            .and_then(Value::as_array)
+            .ok_or(LocalApiError::MalformedResponse)?;
+        let mut parsed = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            parsed.push(
+                address
+                    .as_str()
+                    .and_then(|address| address.parse().ok())
+                    .ok_or(LocalApiError::MalformedResponse)?,
+            );
+        }
+        Ok(parsed)
+    }
+
+    /// Reads the daemon's current peer map. Tailscale uses public-key strings
+    /// as map keys, so the stable identity comes from each PeerStatus `ID`.
+    /// Only the daemon-provided DNSName is exposed.
+    fn peer_directory(&self) -> Result<Vec<PeerDirectoryEntry>, LocalApiError> {
+        let value = self.status()?;
+        let object = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
+        let peers = match object.get("Peer") {
+            None | Some(Value::Null) => None,
+            Some(peers) => Some(peers.as_object().ok_or(LocalApiError::MalformedResponse)?),
+        };
+        if peers.is_some_and(|peers| peers.len() > MAX_PEER_DIRECTORY_ENTRIES) {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        let mut entries = Vec::with_capacity(peers.map_or(0, |peers| peers.len()) + 1);
+        if let Some(self_value) = object.get("Self") {
+            if let Some(details) = self_value.as_object() {
+                if let Some(entry) = Self::parse_peer_directory_entry(details)? {
+                    entries.push(entry);
+                }
+            } else if !self_value.is_null() {
+                return Err(LocalApiError::MalformedResponse);
+            }
+        }
+        if let Some(peers) = peers {
+            for value in peers.values() {
+                let details = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
+                if let Some(entry) = Self::parse_peer_directory_entry(details)? {
+                    entries.push(entry);
+                }
+            }
+        }
+        let mut ids = HashSet::with_capacity(entries.len());
+        if entries.iter().any(|entry| !ids.insert(entry.id.clone())) {
+            return Err(LocalApiError::MalformedResponse);
+        }
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(entries)
+    }
+
+    fn parse_peer_directory_entry(
+        details: &serde_json::Map<String, Value>,
+    ) -> Result<Option<PeerDirectoryEntry>, LocalApiError> {
+        let Some(id) = details.get("ID") else {
+            return Ok(None);
+        };
+        let Some(id) = id.as_str().filter(|id| !id.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(dns_name) = details.get("DNSName") else {
+            return Ok(None);
+        };
+        let Some(dns_name) = dns_name
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 512)
+            .filter(|name| !name.chars().any(char::is_control))
+        else {
+            return Ok(None);
+        };
+        let hostname = dns_name.trim_end_matches('.');
+        let display_name = hostname.split('.').next().filter(|name| !name.is_empty());
+        let Some(display_name) = display_name else {
+            return Ok(None);
+        };
+        if StablePeerId::from_boundary(id.to_owned()).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(PeerDirectoryEntry {
+            id: id.to_owned(),
+            display_name: display_name.to_owned(),
+        }))
+    }
+
+    fn status(&self) -> Result<Value, LocalApiError> {
         let value = self.request("/localapi/v0/status")?;
         let object = value.as_object().ok_or(LocalApiError::MalformedResponse)?;
         if !object.keys().all(|key| {
@@ -96,20 +189,7 @@ impl SystemLocalApi {
         }) {
             return Err(LocalApiError::MalformedResponse);
         }
-        let addresses = value
-            .get("TailscaleIPs")
-            .and_then(Value::as_array)
-            .ok_or(LocalApiError::MalformedResponse)?;
-        let mut parsed = Vec::with_capacity(addresses.len());
-        for address in addresses {
-            parsed.push(
-                address
-                    .as_str()
-                    .and_then(|address| address.parse().ok())
-                    .ok_or(LocalApiError::MalformedResponse)?,
-            );
-        }
-        Ok(parsed)
+        Ok(value)
     }
 
     fn who_is(&self, remote: SocketAddr) -> Result<String, LocalApiError> {
@@ -300,6 +380,22 @@ impl LocalApiError {
             _ => Self::Unavailable,
         }
     }
+}
+
+/// A name projection from the host-local Tailscale peer map. The stable ID is
+/// the transport identity already present in text history events. The display
+/// name is a daemon-provided Tailnet DNS name, never an app-side alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerDirectoryEntry {
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Default)]
+struct PeerDirectoryCache {
+    fetched_at: Option<Instant>,
+    retry_after: Option<Instant>,
+    entries: Vec<PeerDirectoryEntry>,
 }
 
 /// Closed, generic version-1 hub configuration.
@@ -828,6 +924,7 @@ pub struct HubEdge {
     files: Mutex<clipmesh_hub_core::file_store::FileStore>,
     config: EdgeConfig,
     local_api: SystemLocalApi,
+    peer_directory: Mutex<PeerDirectoryCache>,
     core: HubCore,
     sessions: Mutex<Sessions>,
     runtime: Mutex<Runtime>,
@@ -898,6 +995,7 @@ impl HubEdge {
             files: Mutex::new(files),
             config,
             local_api,
+            peer_directory: Mutex::new(PeerDirectoryCache::default()),
             core,
             sessions: Mutex::new(Sessions::default()),
             runtime: Mutex::new(Runtime::default()),
@@ -1040,12 +1138,29 @@ impl HubEdge {
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
             return Ok(ServedConnection::Rejected(response));
         }
-        self.require_ready()?;
         if let Some(response) = validate_http(&request) {
             write_http_response(&mut stream, &response)
                 .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
             return Ok(ServedConnection::Rejected(response));
         }
+        let path = request
+            .target
+            .split_once('?')
+            .map_or(request.target.as_str(), |(path, _)| path);
+        if path == "/v1/source-metadata" {
+            let response = match self.require_ready() {
+                Ok(()) => self.source_metadata_response(now_ms),
+                Err(EdgeFailure(error)) => Err(EdgeFailure(error)),
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(EdgeFailure(error)) => HttpResponse::error(503, error),
+            };
+            write_http_response(&mut stream, &response)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+            return Ok(ServedConnection::Rejected(response));
+        }
+        self.require_ready()?;
         let session = match self.upgrade(admitted, &request) {
             UpgradeResult::Upgraded(session) => session,
             UpgradeResult::Response(response) => {
@@ -1283,6 +1398,92 @@ impl HubEdge {
             body: "{\"status\":\"ok\"}".to_owned(),
         }
     }
+
+    /// Returns the bounded, cached Tailnet peer directory for an admitted
+    /// HTTP caller. The cache avoids a LocalAPI round trip for every history
+    /// row while allowing renamed or newly joined peers to appear promptly.
+    fn cached_peer_directory(&self) -> Result<Vec<PeerDirectoryEntry>, EdgeFailure> {
+        {
+            let cache = self
+                .peer_directory
+                .lock()
+                .expect("peer directory cache lock poisoned");
+            if cache
+                .fetched_at
+                .is_some_and(|fetched_at| fetched_at.elapsed() < PEER_DIRECTORY_CACHE_TTL)
+            {
+                return Ok(cache.entries.clone());
+            }
+            if cache
+                .retry_after
+                .is_some_and(|retry_after| retry_after > Instant::now())
+            {
+                return Err(EdgeFailure(EdgeError::TailscaleLocalapiUnavailable));
+            }
+        }
+        let entries = match self.local_api.peer_directory() {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.peer_directory
+                    .lock()
+                    .expect("peer directory cache lock poisoned")
+                    .retry_after = Some(Instant::now() + PEER_DIRECTORY_FAILURE_TTL);
+                return Err(EdgeFailure(EdgeError::TailscaleLocalapiUnavailable));
+            }
+        };
+        let mut cache = self
+            .peer_directory
+            .lock()
+            .expect("peer directory cache lock poisoned");
+        cache.entries = entries.clone();
+        cache.fetched_at = Some(Instant::now());
+        cache.retry_after = None;
+        Ok(entries)
+    }
+
+    fn source_metadata_response(&self, now_ms: i64) -> Result<HttpResponse, EdgeFailure> {
+        let text_sources = self
+            .core
+            .retained_source_peer_ids(now_ms)
+            .map_err(|error| EdgeFailure(core_error(error)))?;
+        let file_sources = {
+            let files = self.files.lock().expect("file store lock poisoned");
+            files
+                .history_with_sources(now_ms)
+                .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?
+        };
+        let mut source_ids = text_sources
+            .iter()
+            .map(|source| source.as_boundary_value().to_owned())
+            .collect::<HashSet<_>>();
+        source_ids.extend(
+            file_sources
+                .iter()
+                .map(|source| source.source_peer_id.clone()),
+        );
+        let peers = self
+            .cached_peer_directory()?
+            .into_iter()
+            .filter(|peer| source_ids.contains(&peer.id))
+            .collect::<Vec<_>>();
+        Ok(HttpResponse {
+            status: 200,
+            body: json!({
+                "protocol_version": 1,
+                "type": "source_metadata",
+                "peers": peers.iter().map(|peer| json!({
+                    "id": peer.id,
+                    "display_name": peer.display_name,
+                })).collect::<Vec<_>>(),
+                "file_sources": file_sources.iter().map(|clip| json!({
+                    "clip_id": clip.clip_id.to_string(),
+                    "source_peer_id": clip.source_peer_id,
+                })).collect::<Vec<_>>(),
+            })
+            .to_string(),
+        })
+    }
+
     pub fn poll_localapi(&self) {
         let loss = match self.local_api.self_addresses() {
             Ok(addresses) if addresses.contains(&self.config.listen_address.ip()) => None,
@@ -1854,7 +2055,8 @@ fn validate_http(request: &HttpRequest) -> Option<HttpResponse> {
         .target
         .split_once('?')
         .map_or(request.target.as_str(), |(path, _)| path);
-    if path != "/v1/stream" {
+    let metadata = path == "/v1/source-metadata";
+    if path != "/v1/stream" && !metadata {
         return Some(
             HttpResponse::error(404, EdgeError::ConfigValueInvalid)
                 .with_code("http_path_not_found", false),
@@ -1882,6 +2084,24 @@ fn validate_http(request: &HttpRequest) -> Option<HttpResponse> {
             HttpResponse::error(403, EdgeError::ConfigValueInvalid)
                 .with_code("client_identity_claim_forbidden", false),
         );
+    }
+    if metadata {
+        if request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("upgrade")
+                || name.eq_ignore_ascii_case("sec-websocket-version")
+                || name.eq_ignore_ascii_case("sec-websocket-key")
+                || name.eq_ignore_ascii_case("sec-websocket-protocol")
+                || (name.eq_ignore_ascii_case("connection")
+                    && value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+        }) {
+            return Some(HttpResponse::error(
+                400,
+                EdgeError::ProtocolVersionUnsupported,
+            ));
+        }
+        return None;
     }
     let protocols: Vec<_> = request
         .headers
@@ -1973,12 +2193,14 @@ fn read_http_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
 
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> std::io::Result<()> {
     let status = match response.status {
+        200 => "OK",
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     write!(
@@ -2243,6 +2465,16 @@ mod tests {
                                     let mut contract = compatibility_contract();
                                     contract["status"]["TailscaleIPs"] =
                                         json!([state.address.to_string()]);
+                                    contract["status"]["Self"] = json!({
+                                        "ID": "self-reserved-example",
+                                        "DNSName": "gibson.tail.example."
+                                    });
+                                    contract["status"]["Peer"] = json!({
+                                        "nodekey:peer-reserved-example": {
+                                            "ID": state.peer.unwrap_or("peer-reserved-example"),
+                                            "DNSName": "desktop.tail.example."
+                                        }
+                                    });
                                     serde_json::to_string(&contract["status"]).unwrap()
                                 } else {
                                     format!(r#"{{"TailscaleIPs":["{}"]}}"#, state.address)
@@ -2638,6 +2870,98 @@ mod tests {
                 .unwrap(),
             "peer-reserved-example"
         );
+        assert_eq!(
+            local_api.peer_directory().unwrap(),
+            vec![
+                PeerDirectoryEntry {
+                    id: "peer-reserved-example".to_owned(),
+                    display_name: "desktop".to_owned(),
+                },
+                PeerDirectoryEntry {
+                    id: "self-reserved-example".to_owned(),
+                    display_name: "gibson".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn source_metadata_uses_retained_sources_and_never_changes_v1_events() {
+        let (_directory, daemon, edge) = edge();
+        daemon.state.lock().unwrap().documented_shape = true;
+        let source = live(&edge);
+        let publish = r#"{"protocol_version":1,"type":"publish","event":{"message_id":"00000000-0000-4000-8000-000000000051","clear_generation":"1","created_at_ms":1700000000000,"content_type":"text/plain","payload_bytes":12,"content_sha256":"5cb72f90e968922d30557d0af8f719d21f61792becaa87eb32477767d739dc0b","payload_b64":"Zml4dHVyZSB0ZXh0"}}"#;
+        edge.handle_text(source, publish, NOW).unwrap();
+        let response = edge.source_metadata_response(NOW).unwrap();
+        let body: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["type"], "source_metadata");
+        assert_eq!(
+            body["peers"],
+            json!([{
+                "id": "peer-reserved-example",
+                "display_name": "desktop"
+            }])
+        );
+        assert_eq!(body["file_sources"], json!([]));
+    }
+
+    #[test]
+    fn source_metadata_http_validation_accepts_plain_get_only() {
+        let plain = HttpRequest {
+            method: "GET".to_owned(),
+            target: "/v1/source-metadata".to_owned(),
+            headers: vec![("Connection".to_owned(), "keep-alive".to_owned())],
+            header_bytes: 32,
+        };
+        assert!(validate_http(&plain).is_none());
+        let websocket_claim = HttpRequest {
+            headers: vec![("Upgrade".to_owned(), "websocket".to_owned())],
+            ..plain
+        };
+        assert_eq!(validate_http(&websocket_claim).unwrap().status, 400);
+    }
+
+    #[test]
+    fn source_metadata_http_is_served_after_socket_admission() {
+        let directory = tempdir().unwrap();
+        let daemon = LocalApiSimulator::admitted();
+        daemon.state.lock().unwrap().address = "127.0.0.1".parse().unwrap();
+        daemon.state.lock().unwrap().documented_shape = true;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut configured = config();
+        configured.listen_address = address;
+        configured.state_directory = directory.path().to_path_buf();
+        let edge = Arc::new(
+            HubEdge::prepare(
+                configured,
+                daemon.client(),
+                directory.path().join("hub.sqlite"),
+            )
+            .unwrap(),
+        );
+        let server_edge = Arc::clone(&edge);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server_edge.serve_accepted(stream, NOW)
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /v1/source-metadata HTTP/1.1\r\nHost: simulator\r\n\r\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#""type":"source_metadata""#));
+        assert!(matches!(
+            server.join().unwrap(),
+            Ok(ServedConnection::Rejected(HttpResponse { status: 200, .. }))
+        ));
+        let requests = &daemon.state.lock().unwrap().requests;
+        assert!(requests
+            .iter()
+            .any(|target| target.starts_with("/localapi/v0/whois?addr=127.0.0.1:")));
     }
 
     #[test]
