@@ -647,4 +647,246 @@ mod file_loop_tests {
             "running agent did not deliver the new file"
         );
     }
+
+    #[cfg(target_os = "linux")]
+    struct LinuxImageDesktop {
+        clipboard: MacPasteboard,
+        received_root: std::path::PathBuf,
+        received_name: String,
+        delivered: Arc<AtomicBool>,
+        deadline: std::time::Instant,
+        stop_at: Option<std::time::Instant>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ClipboardAdapter for LinuxImageDesktop {
+        fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError> {
+            self.clipboard.is_current(revision)
+        }
+
+        fn write_text(&mut self, bytes: &[u8]) -> Result<PlatformRevision, AdapterError> {
+            self.clipboard.write_text(bytes)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Desktop for LinuxImageDesktop {
+        fn file_revision(&mut self) -> Result<Option<PlatformRevision>, AgentError> {
+            self.clipboard
+                .current_revision()
+                .map_err(|_| AgentError::AdapterUnavailable)
+        }
+
+        fn file_observation(
+            &mut self,
+        ) -> Result<Option<(Vec<std::path::PathBuf>, PlatformRevision)>, AgentError> {
+            self.clipboard
+                .observe_files()
+                .map_err(|_| AgentError::AdapterUnavailable)
+        }
+
+        fn apply_files(
+            &mut self,
+            paths: &[std::path::PathBuf],
+            revision: &PlatformRevision,
+        ) -> Result<Option<PlatformRevision>, AgentError> {
+            self.clipboard
+                .write_files_if_current(paths, revision)
+                .map_err(|_| AgentError::AdapterUnavailable)
+        }
+
+        fn locked(&mut self) -> bool {
+            false
+        }
+
+        fn observation(&mut self) -> Result<Option<LocalObservation>, AgentError> {
+            Ok(None)
+        }
+
+        fn service_control(&mut self, _: &mut AgentCore) -> Result<bool, AgentError> {
+            if let Some((paths, _)) = self.clipboard.observe_files().unwrap() {
+                if paths.len() == 1
+                    && paths[0].starts_with(&self.received_root)
+                    && paths[0].file_name().and_then(|name| name.to_str())
+                        == Some(self.received_name.as_str())
+                {
+                    if !self.delivered.swap(true, Ordering::AcqRel) {
+                        assert_eq!(std::fs::read(&paths[0]).unwrap(), ONE_BY_ONE_PNG);
+                        assert!(self.clipboard.observe_text().unwrap().is_none());
+                        let mimes = MacPasteboard::capture_mime_types().unwrap();
+                        assert!(mimes.iter().any(|mime| mime == "image/png"));
+                        assert!(mimes.iter().any(|mime| mime == "text/uri-list"));
+                        assert!(mimes.iter().any(|mime| {
+                            mime.starts_with("application/x-clipmesh-write-marker-")
+                        }));
+                        // Leave the loop alive for two file-poll intervals so
+                        // a remote selection cannot immediately echo back.
+                        self.stop_at = Some(std::time::Instant::now() + Duration::from_secs(7));
+                    }
+                }
+            }
+            if self
+                .stop_at
+                .is_some_and(|stop_at| std::time::Instant::now() >= stop_at)
+            {
+                return Err(AgentError::AdapterUnavailable);
+            }
+            if std::time::Instant::now() >= self.deadline {
+                return Err(AgentError::AdapterUnavailable);
+            }
+            Ok(false)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    const ONE_BY_ONE_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn publish_raw_png(bytes: &[u8]) {
+        use wl_clipboard_rs::copy::{MimeSource, MimeType, Options, Source};
+
+        Options::new()
+            .copy_multi(vec![MimeSource {
+                source: Source::Bytes(bytes.to_vec().into_boxed_slice()),
+                mime_type: MimeType::Specific("image/png".to_owned()),
+            }])
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CLIPMESH_TEST_HUB_URL, CLIPMESH_ISOLATED_WAYLAND=1, and a private compositor"]
+    fn running_agent_uploads_and_receives_png_without_echo() {
+        use clipmesh_protocol::files::FileDescriptor;
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(env::var("CLIPMESH_ISOLATED_WAYLAND").unwrap(), "1");
+        let endpoint = env::var("CLIPMESH_TEST_HUB_URL").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = AgentConfig::parse_toml(&format!(
+            "config_version=1\nhub_url={endpoint:?}\nplatform=\"linux-wayland\"\nstate_path={:?}\ncontrol_socket={:?}",
+            root.path().join("state.sqlite"),
+            root.path().join("control.sock")
+        ))
+        .unwrap();
+        let core = AgentCore::open(&config.state_path).unwrap();
+        let delivered = Arc::new(AtomicBool::new(false));
+        let remote_id = clipmesh_protocol::UuidV4::new();
+        let remote_name = format!("remote-{}.png", remote_id.get());
+        let mut clipboard = MacPasteboard::connect().unwrap();
+        clipboard.write_text(b"synthetic loop baseline").unwrap();
+        let desktop = LinuxImageDesktop {
+            clipboard,
+            received_root: root.path().to_owned(),
+            received_name: remote_name.clone(),
+            delivered: delivered.clone(),
+            deadline: std::time::Instant::now() + Duration::from_secs(35),
+            stop_at: None,
+        };
+
+        let sender_config = config.clone();
+        let sender_delivered = delivered.clone();
+        let sender = thread::spawn(move || -> Result<(), String> {
+            thread::sleep(Duration::from_secs(6));
+            let _source = MacPasteboard::connect().map_err(|_| "source connect".to_owned())?;
+            let mut baseline_client = clipmesh_agent::files::FileTransport::connect(&sender_config)
+                .map_err(|_| "baseline connect".to_owned())?;
+            let baseline_ids = baseline_client
+                .history()
+                .map_err(|_| "baseline history".to_owned())?
+                .into_iter()
+                .map(|clip| clip.clip_id)
+                .collect::<std::collections::HashSet<_>>();
+            drop(baseline_client);
+            publish_raw_png(ONE_BY_ONE_PNG);
+            let local_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut local_verified = false;
+            while std::time::Instant::now() < local_deadline {
+                if let Ok(mut client) =
+                    clipmesh_agent::files::FileTransport::connect(&sender_config)
+                {
+                    if let Ok(clips) = client.history() {
+                        for clip in clips {
+                            if clip.manifest.files.len() == 1
+                                && !baseline_ids.contains(&clip.clip_id)
+                                && clip.manifest.files[0].name == "Screenshot.png"
+                                && clip.manifest.files[0].media_type == "image/png"
+                                && client.download(&clip, 0).ok().as_deref() == Some(ONE_BY_ONE_PNG)
+                            {
+                                local_verified = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if local_verified {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            if !local_verified {
+                return Err("local PNG upload was not observed in hub history".to_owned());
+            }
+
+            let remote = FileDescriptor {
+                name: remote_name.clone(),
+                media_type: "image/png".to_owned(),
+                size_bytes: ONE_BY_ONE_PNG.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(ONE_BY_ONE_PNG)),
+            };
+            let mut client = clipmesh_agent::files::FileTransport::connect(&sender_config)
+                .map_err(|_| "remote connect".to_owned())?;
+            client
+                .publish(remote_id.clone(), &[(remote, ONE_BY_ONE_PNG.to_vec())])
+                .map_err(|_| "remote publish".to_owned())?;
+
+            let delivery_deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !sender_delivered.load(Ordering::Acquire)
+                && std::time::Instant::now() < delivery_deadline
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !sender_delivered.load(Ordering::Acquire) {
+                return Err("remote PNG was not applied to the clipboard".to_owned());
+            }
+            // The desktop loop remains alive for seven seconds after the
+            // remote selection arrives. Check after that window closes.
+            thread::sleep(Duration::from_secs(8));
+            let mut client = clipmesh_agent::files::FileTransport::connect(&sender_config)
+                .map_err(|_| "echo-check connect".to_owned())?;
+            let matching_clips = client
+                .history()
+                .map_err(|_| "echo-check history".to_owned())?
+                .into_iter()
+                .filter(|clip| {
+                    !baseline_ids.contains(&clip.clip_id)
+                        && clip.manifest.files.len() == 1
+                        && clip.manifest.files[0].name == remote_name
+                        && clip.manifest.files[0].media_type == "image/png"
+                })
+                .collect::<Vec<_>>();
+            if matching_clips.len() != 1
+                || matching_clips[0].clip_id != remote_id
+                || client.download(&matching_clips[0], 0).ok().as_deref() != Some(ONE_BY_ONE_PNG)
+            {
+                return Err(format!(
+                    "remote PNG history delta was invalid: {} matching clips",
+                    matching_clips.len()
+                ));
+            }
+            Ok(())
+        });
+
+        let _ = run_desktop(config, core, desktop);
+        assert!(delivered.load(Ordering::Acquire));
+        sender.join().unwrap().unwrap();
+    }
 }

@@ -14,6 +14,7 @@ thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 os_pipe = "1"
+tempfile = "3"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wl-clipboard-rs = "0.9"

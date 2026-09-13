@@ -94,6 +94,7 @@ final class ExplicitClipboardUITests: XCTestCase {
         send.tap()
         if permission.waitForExistence(timeout: 5) { permission.tap() }
         XCTAssertTrue(app.staticTexts["Copied to ClipMesh"].waitForExistence(timeout: 15))
+        scrollHistoryToTop(app)
         let preview = app.buttons["latestClip"]
         XCTAssertTrue(preview.waitForExistence(timeout: 10))
         XCTAssertTrue(preview.label.contains(sentText))
@@ -102,6 +103,7 @@ final class ExplicitClipboardUITests: XCTestCase {
         app.terminate()
         app.launch()
         if permission.waitForExistence(timeout: 5) { permission.tap() }
+        scrollHistoryToTop(app)
         XCTAssertTrue(preview.waitForExistence(timeout: 10))
         XCTAssertTrue(preview.label.contains(sentText))
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline + 1, "Reopening with shared history must preserve local clipboard")
@@ -122,5 +124,61 @@ final class ExplicitClipboardUITests: XCTestCase {
         screenshot.lifetime = .keepAlways
         add(screenshot)
         app.terminate()
+    }
+
+    func testNotesTextWinsOverWebArchiveOnSend() throws {
+        let endpoint = ProcessInfo.processInfo.environment["CLIPMESH_TEST_HUB_URL"] ?? ""
+        guard endpoint.hasPrefix("ws://") else {
+            throw XCTSkip("Requires an isolated test hub")
+        }
+        continueAfterFailure = false
+        let sentText = "Notes UI test " + UUID().uuidString
+        let provider = NSItemProvider(object: sentText as NSString)
+        provider.registerDataRepresentation(forTypeIdentifier: "com.apple.webarchive", visibility: .all) { completion in
+            completion(Data("web archive should not be sent".utf8), nil)
+            return nil
+        }
+        UIPasteboard.general.setItemProviders([provider], localOnly: true, expirationDate: nil)
+        let baseline = UIPasteboard.general.changeCount
+        let app = XCUIApplication()
+        app.launchArguments = ["-hub_url", endpoint]
+        addUIInterruptionMonitor(withDescription: "Paste permission") { alert in
+            if alert.buttons["Allow Paste"].exists {
+                alert.buttons["Allow Paste"].tap()
+                return true
+            }
+            if alert.buttons["Allow"].exists {
+                alert.buttons["Allow"].tap()
+                return true
+            }
+            return false
+        }
+        app.launch()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let permission = springboard.alerts.buttons["Allow Paste"]
+        if permission.waitForExistence(timeout: 5) { permission.tap() }
+        let send = app.buttons["copyToClipMesh"]
+        XCTAssertTrue(send.waitForExistence(timeout: 15))
+        expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: send)
+        waitForExpectations(timeout: 15)
+        XCTAssertTrue(send.label.contains(sentText))
+        XCTAssertEqual(UIPasteboard.general.changeCount, baseline)
+        send.tap()
+        if permission.waitForExistence(timeout: 5) { permission.tap() }
+        XCTAssertTrue(app.staticTexts["Copied to ClipMesh"].waitForExistence(timeout: 15))
+        scrollHistoryToTop(app)
+        let preview = app.buttons["latestClip"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 10))
+        XCTAssertTrue(preview.label.contains(sentText))
+        let webArchiveRows = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "webarchive"))
+        XCTAssertEqual(webArchiveRows.count, 0)
+        XCTAssertEqual(UIPasteboard.general.changeCount, baseline)
+        app.terminate()
+    }
+
+    private func scrollHistoryToTop(_ app: XCUIApplication) {
+        let scrollView = app.scrollViews.firstMatch
+        guard scrollView.waitForExistence(timeout: 5) else { return }
+        for _ in 0 ..< 5 { scrollView.swipeDown() }
     }
 }

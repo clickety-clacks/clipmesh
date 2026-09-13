@@ -1,9 +1,12 @@
 import Foundation
+import ImageIO
 import QuickLookThumbnailing
 import UIKit
 import UniformTypeIdentifiers
 
 struct LocalFileSelection: Identifiable {
+    private static let maximumClipboardFileBytes = 100 * 1024 * 1024
+
     let id = UUID()
     let descriptor: MeshFileDescriptor
     let data: Data
@@ -14,12 +17,24 @@ struct LocalFileSelection: Identifiable {
             let types = provider.registeredTypeIdentifiers
             // Prefer the actual media representation over an accompanying URL
             // or text caption. Generic binary files remain supported.
-            let preferred = types.contains(UTType.fileURL.identifier) ? UTType.fileURL.identifier : types.first { identifier in
-                guard let type = UTType(identifier) else { return false }
-                return type.conforms(to: .image) || type.conforms(to: .movie)
-            } ?? types.first { identifier in
-                guard let type = UTType(identifier) else { return false }
-                return type.conforms(to: .data) && !type.conforms(to: .text) && !type.conforms(to: .url)
+            let preferred: String?
+            if types.contains(UTType.fileURL.identifier) {
+                // A file provider may also expose an image thumbnail. Keep
+                // the selected file as the source of truth in that case.
+                preferred = UTType.fileURL.identifier
+            } else {
+                preferred = types.first { identifier in
+                    guard let type = UTType(identifier) else { return false }
+                    return type.conforms(to: .image) || type.conforms(to: .movie)
+                } ?? types.first { identifier in
+                    // Notes and browsers offer a web archive alongside their
+                    // plain-text representation. That is alternate formatting,
+                    // not a user-selected file. Explicit file URLs and media
+                    // above still take priority over accompanying captions.
+                    guard !provider.canLoadObject(ofClass: NSString.self) else { return false }
+                    guard let type = UTType(identifier) else { return false }
+                    return type.conforms(to: .data) && !type.conforms(to: .text) && !type.conforms(to: .url)
+                }
             }
             return preferred.map { (provider, $0) }
         }
@@ -45,33 +60,130 @@ struct LocalFileSelection: Identifiable {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
                 attributes: [.protectionKey: FileProtectionType.complete])
             defer { try? FileManager.default.removeItem(at: folder) }
+            let representation = try await loadClipboardRepresentation(provider, identifier: identifier)
             let suggested = provider.suggestedName ?? "Clipboard"
             let name = URL(fileURLWithPath: suggested).lastPathComponent
-            let suffix = UTType(identifier)?.preferredFilenameExtension ?? "bin"
+            let suffix = representation.type.preferredFilenameExtension ?? "bin"
             let safeName = name.isEmpty || name == "." || name == ".." ? "Clipboard" : name
-            let filename = URL(fileURLWithPath: safeName).pathExtension.isEmpty ? safeName + "." + suffix : safeName
-            let destination = folder.appendingPathComponent(filename)
-            let url: URL = try await withCheckedThrowingContinuation { continuation in
-                provider.loadFileRepresentation(forTypeIdentifier: identifier) { source, error in
-                    do {
-                        guard let source else { throw error ?? FileTransferFailure.invalidReply }
-                        let values = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-                        guard values.isRegularFile == true, let size = values.fileSize, size <= 100 * 1024 * 1024 else {
-                            throw FileTransferFailure.limit
-                        }
-                        // The provider deletes its temporary file when this
-                        // callback returns, so copy before resuming the task.
-                        try FileManager.default.copyItem(at: source, to: destination)
-                        continuation.resume(returning: destination)
-                    } catch { continuation.resume(throwing: error) }
-                }
+            let suggestedURL = URL(fileURLWithPath: safeName)
+            let suggestedType = suggestedURL.pathExtension.isEmpty
+                ? nil
+                : UTType(filenameExtension: suggestedURL.pathExtension)
+            let filename: String
+            if suggestedURL.pathExtension.isEmpty {
+                filename = safeName + "." + suffix
+            } else if !representation.type.conforms(to: .image)
+                        || suggestedType?.conforms(to: representation.type) == true {
+                filename = safeName
+            } else {
+                filename = suggestedURL.deletingPathExtension().lastPathComponent + "." + suffix
             }
-            let loaded = try await read([url])
+            let destination = folder.appendingPathComponent(filename)
+            guard representation.data.count <= Self.maximumClipboardFileBytes else { throw FileTransferFailure.limit }
+            try representation.data.write(to: destination, options: [.completeFileProtection])
+            let loaded = try await read([destination])
             total += loaded[0].descriptor.size_bytes
             guard total <= 500 * 1024 * 1024 else { throw FileTransferFailure.limit }
             files.append(contentsOf: loaded)
         }
         return files
+    }
+
+    private static func loadClipboardRepresentation(
+        _ provider: NSItemProvider,
+        identifier: String,
+    ) async throws -> (data: Data, type: UTType) {
+        let declaredType = UTType(identifier) ?? .data
+
+        do {
+            let data = try await loadFileRepresentation(provider, identifier: identifier)
+            return (data, resolvedImageType(data, declared: declaredType))
+        } catch let error {
+            if case FileTransferFailure.limit = error { throw error }
+        }
+        // Screenshots and some share extensions expose an image object or
+        // data representation without a file representation. Ask for bytes
+        // next so the original image format survives when possible.
+        do {
+            let data = try await loadDataRepresentation(provider, identifier: identifier)
+            return (data, resolvedImageType(data, declared: declaredType))
+        } catch let error {
+            if case FileTransferFailure.limit = error { throw error }
+        }
+        if declaredType.conforms(to: .image),
+           let image = try? await loadImageObject(provider),
+           let data = image.pngData() {
+            guard data.count <= Self.maximumClipboardFileBytes else { throw FileTransferFailure.limit }
+            return (data, .png)
+        }
+        throw FileTransferFailure.invalidReply
+    }
+
+    private static func resolvedImageType(_ data: Data, declared: UTType) -> UTType {
+        guard declared == .image,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let identifier = CGImageSourceGetType(source) as String?,
+              let detected = UTType(identifier)
+        else { return declared }
+        return detected
+    }
+
+    private static func loadDataRepresentation(
+        _ provider: NSItemProvider,
+        identifier: String,
+    ) async throws -> Data {
+        let maximumBytes = 100 * 1024 * 1024
+        return try await withCheckedThrowingContinuation { continuation in
+            provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, error in
+                if let data {
+                    if data.count <= maximumBytes {
+                        continuation.resume(returning: data)
+                    } else {
+                        continuation.resume(throwing: FileTransferFailure.limit)
+                    }
+                } else {
+                    continuation.resume(throwing: error ?? FileTransferFailure.invalidReply)
+                }
+            }
+        }
+    }
+
+    private static func loadFileRepresentation(
+        _ provider: NSItemProvider,
+        identifier: String,
+    ) async throws -> Data {
+        let maximumBytes = 100 * 1024 * 1024
+        return try await withCheckedThrowingContinuation { continuation in
+            provider.loadFileRepresentation(forTypeIdentifier: identifier) { source, error in
+                do {
+                    guard let source else { throw error ?? FileTransferFailure.invalidReply }
+                    let values = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                    guard values.isRegularFile == true, let size = values.fileSize,
+                          size <= maximumBytes else {
+                        throw FileTransferFailure.limit
+                    }
+                    let data = try Data(contentsOf: source, options: .mappedIfSafe)
+                    guard data.count <= maximumBytes else {
+                        throw FileTransferFailure.limit
+                    }
+                    continuation.resume(returning: data)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private static func loadImageObject(_ provider: NSItemProvider) async throws -> UIImage {
+        try await withCheckedThrowingContinuation { continuation in
+            provider.loadObject(ofClass: UIImage.self) { value, error in
+                if let image = value as? UIImage {
+                    continuation.resume(returning: image)
+                } else {
+                    continuation.resume(throwing: error ?? FileTransferFailure.invalidReply)
+                }
+            }
+        }
     }
 
     static func read(_ urls: [URL]) async throws -> [Self] {

@@ -399,9 +399,13 @@ fn classify_mime_types(types: &[String]) -> Result<HintClassification, LinuxAdap
 }
 
 pub mod file_urls;
+pub mod image_offer;
 
 pub struct WaylandClipboard {
     inner: platform_wayland::Clipboard,
+    #[cfg(target_os = "linux")]
+    captured_image:
+        std::sync::Mutex<Option<(PlatformRevision, tempfile::TempDir, std::path::PathBuf)>>,
 }
 
 impl WaylandClipboard {
@@ -413,6 +417,51 @@ impl WaylandClipboard {
     pub fn observe_files(
         &self,
     ) -> Result<Option<(Vec<std::path::PathBuf>, PlatformRevision)>, LinuxAdapterError> {
+        // A raw image can be as large as 100 MiB. Avoid cloning its bytes on
+        // every polling pass once the image already has a staged path.
+        if let Some(current) = self.inner.current_revision()? {
+            let staged = self
+                .captured_image
+                .lock()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            if let Some((revision, _, path)) = staged.as_ref() {
+                if revision == &current {
+                    return Ok(Some((vec![path.clone()], current)));
+                }
+            }
+        }
+        if let Some((bytes, mime, revision)) = self.inner.observe_image()? {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut staged = self
+                .captured_image
+                .lock()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            if let Some((previous, _, path)) = staged.as_ref() {
+                if previous == &revision {
+                    return Ok(Some((vec![path.clone()], revision)));
+                }
+            }
+            let directory = tempfile::Builder::new()
+                .prefix("clipmesh-image-")
+                .tempdir()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            let path = directory.path().join(if mime == "image/png" {
+                "Screenshot.png"
+            } else {
+                "Clipboard.jpg"
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            file.write_all(&bytes)
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            *staged = Some((revision.clone(), directory, path.clone()));
+            return Ok(Some((vec![path], revision)));
+        }
         self.inner.observe_files()
     }
     #[cfg(target_os = "linux")]
@@ -425,10 +474,33 @@ impl WaylandClipboard {
         if !self.inner.is_current(expected)? {
             return Ok(None);
         }
-        self.inner.write_payload(&bytes, true).map(Some)
+        let image = if paths.len() == 1 {
+            match image_offer::png_offer(&paths[0]) {
+                Ok(Some(data)) => Some(("image/png".to_owned(), data)),
+                Ok(None) => None,
+                // Keep publishing the native file selection when the
+                // optional image offer cannot be read or converted.
+                Err(error) => {
+                    eprintln!("clipmesh_image_offer_failed kind={:?}", error.kind());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !self.inner.is_current(expected)? {
+            return Ok(None);
+        }
+        self.inner
+            .write_payload_with_image(&bytes, true, image)
+            .map(Some)
     }
     pub fn connect() -> Result<Self, LinuxAdapterError> {
-        platform_wayland::Clipboard::connect().map(|inner| Self { inner })
+        platform_wayland::Clipboard::connect().map(|inner| Self {
+            inner,
+            #[cfg(target_os = "linux")]
+            captured_image: std::sync::Mutex::new(None),
+        })
     }
 
     pub fn observe_text(&self) -> Result<Option<LocalObservation>, LinuxAdapterError> {
@@ -444,6 +516,9 @@ impl WaylandClipboard {
         platform_wayland::capture_mime_types()
     }
 }
+
+#[cfg(target_os = "linux")]
+const MAX_IMAGE_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 impl ClipboardAdapter for WaylandClipboard {
     fn is_current(&mut self, revision: &PlatformRevision) -> Result<bool, AdapterError> {
@@ -558,7 +633,7 @@ mod platform_lock {
 
 #[cfg(target_os = "linux")]
 mod platform_wayland {
-    use super::{classify_mime_types, LinuxAdapterError};
+    use super::{classify_mime_types, LinuxAdapterError, MAX_IMAGE_FILE_BYTES};
     use clipmesh_agent_core::{LocalObservation, PlatformRevision};
     use os_pipe::pipe;
     use std::{
@@ -601,6 +676,7 @@ mod platform_wayland {
 
     struct WatchState {
         current_is_file: bool,
+        current_image_mime: Option<String>,
         instance: u64,
         generation: u64,
         current_revision: Option<PlatformRevision>,
@@ -615,6 +691,7 @@ mod platform_wayland {
         fn new(instance: u64) -> Self {
             Self {
                 current_is_file: false,
+                current_image_mime: None,
                 instance,
                 generation: 0,
                 current_revision: None,
@@ -638,6 +715,14 @@ mod platform_wayland {
             ));
             self.current_revision = Some(revision.clone());
             self.current_is_file = mime_types.iter().any(|mime| mime == "text/uri-list");
+            self.current_image_mime = if self.current_is_file {
+                None
+            } else {
+                ["image/png", "image/jpeg"]
+                    .into_iter()
+                    .find(|mime| mime_types.iter().any(|m| m == mime))
+                    .map(str::to_owned)
+            };
             self.snapshot = if has_offer {
                 SelectionSnapshot::Pending
             } else {
@@ -739,7 +824,7 @@ mod platform_wayland {
                 }
                 match &state.snapshot {
                     SelectionSnapshot::Ready(observation) => {
-                        if state.current_is_file {
+                        if state.current_is_file || state.current_image_mime.is_some() {
                             return Ok(None);
                         }
                         return Ok(Some(observation.clone()));
@@ -796,6 +881,33 @@ mod platform_wayland {
             Ok(None)
         }
 
+        pub(super) fn observe_image(
+            &self,
+        ) -> Result<Option<(Vec<u8>, String, PlatformRevision)>, LinuxAdapterError> {
+            let state = self
+                .shared
+                .0
+                .lock()
+                .map_err(|_| LinuxAdapterError::AdapterUnavailable)?;
+            if state.failed {
+                return Err(LinuxAdapterError::AdapterUnavailable);
+            }
+            if let (Some(mime), SelectionSnapshot::Ready(observation)) =
+                (&state.current_image_mime, &state.snapshot)
+            {
+                if observation.hint == clipmesh_agent_core::HintClassification::Ordinary
+                    && !observation.bytes.is_empty()
+                {
+                    return Ok(Some((
+                        observation.bytes.clone(),
+                        mime.clone(),
+                        observation.revision.clone(),
+                    )));
+                }
+            }
+            Ok(None)
+        }
+
         pub(super) fn next_observation(&self) -> Result<LocalObservation, LinuxAdapterError> {
             self.observations
                 .recv()
@@ -829,6 +941,15 @@ mod platform_wayland {
             bytes: &[u8],
             files: bool,
         ) -> Result<PlatformRevision, LinuxAdapterError> {
+            self.write_payload_with_image(bytes, files, None)
+        }
+
+        pub(super) fn write_payload_with_image(
+            &self,
+            bytes: &[u8],
+            files: bool,
+            image: Option<(String, Vec<u8>)>,
+        ) -> Result<PlatformRevision, LinuxAdapterError> {
             let (mutex, condition) = &*self.shared;
             let (before, write_marker) = {
                 let mut state = mutex
@@ -837,23 +958,27 @@ mod platform_wayland {
                 (state.generation, state.begin_write())
             };
 
-            if CopyOptions::new()
-                .copy_multi(vec![
-                    MimeSource {
-                        source: Source::Bytes(bytes.to_vec().into_boxed_slice()),
-                        mime_type: if files {
-                            CopyMimeType::Specific("text/uri-list".into())
-                        } else {
-                            CopyMimeType::Text
-                        },
+            let mut sources = vec![
+                MimeSource {
+                    source: Source::Bytes(bytes.to_vec().into_boxed_slice()),
+                    mime_type: if files {
+                        CopyMimeType::Specific("text/uri-list".into())
+                    } else {
+                        CopyMimeType::Text
                     },
-                    MimeSource {
-                        source: Source::Bytes(Vec::new().into_boxed_slice()),
-                        mime_type: CopyMimeType::Specific(write_marker),
-                    },
-                ])
-                .is_err()
-            {
+                },
+                MimeSource {
+                    source: Source::Bytes(Vec::new().into_boxed_slice()),
+                    mime_type: CopyMimeType::Specific(write_marker),
+                },
+            ];
+            if let Some((mime, data)) = image {
+                sources.push(MimeSource {
+                    source: Source::Bytes(data.into_boxed_slice()),
+                    mime_type: CopyMimeType::Specific(mime),
+                });
+            }
+            if CopyOptions::new().copy_multi(sources).is_err() {
                 if let Ok(mut state) = mutex.lock() {
                     state.pending_write_marker = None;
                 }
@@ -940,10 +1065,15 @@ mod platform_wayland {
                 return;
             };
             let is_file = mime_types.iter().any(|mime| mime == "text/uri-list");
+            let image_mime = ["image/png", "image/jpeg"]
+                .into_iter()
+                .find(|mime| mime_types.iter().any(|m| m == mime));
             let selected_mime = if is_file {
                 Some("text/uri-list".into())
             } else {
-                preferred_text_mime(&mime_types)
+                image_mime
+                    .map(str::to_owned)
+                    .or_else(|| preferred_text_mime(&mime_types))
             };
             let Some(mime_type) = selected_mime else {
                 publish_empty(&self.shared, generation);
@@ -967,7 +1097,16 @@ mod platform_wayland {
             let observations = self.observations.clone();
             thread::spawn(move || {
                 let mut bytes = Vec::new();
-                let read = reader.take(HARD_MAX_CAPTURE_BYTES).read_to_end(&mut bytes);
+                let limit = if image_mime.is_some() && !is_file {
+                    MAX_IMAGE_FILE_BYTES + 1
+                } else {
+                    HARD_MAX_CAPTURE_BYTES
+                };
+                let read = reader.take(limit).read_to_end(&mut bytes);
+                if bytes.len() as u64 >= limit {
+                    publish_unavailable(&shared, generation);
+                    return;
+                }
                 let observation = match read {
                     Ok(_) => classify_mime_types(&mime_types).map(|hint| LocalObservation {
                         bytes,
@@ -978,7 +1117,10 @@ mod platform_wayland {
                 };
                 match observation {
                     Ok(observation) => {
-                        if publish_ready(&shared, generation, &observation) && !is_file {
+                        if publish_ready(&shared, generation, &observation)
+                            && !is_file
+                            && image_mime.is_none()
+                        {
                             let _ = observations.send(observation);
                         }
                     }
@@ -1240,6 +1382,145 @@ mod tests {
     use super::*;
     use std::{collections::VecDeque, io, net::Shutdown, os::unix::net::UnixStream, thread};
     use tempfile::TempDir;
+
+    #[cfg(target_os = "linux")]
+    const ONE_BY_ONE_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5,
+        0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64,
+        0xf8, 0x0f, 0x00, 0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn publish_raw_png(bytes: &[u8]) {
+        use wl_clipboard_rs::copy::{MimeSource, MimeType, Options, Source};
+
+        Options::new()
+            .copy_multi(vec![MimeSource {
+                source: Source::Bytes(bytes.to_vec().into_boxed_slice()),
+                mime_type: MimeType::Specific("image/png".to_owned()),
+            }])
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_current_png() -> Vec<u8> {
+        use std::io::Read;
+        use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
+
+        let (mut reader, mime) = get_contents(
+            ClipboardType::Regular,
+            Seat::Unspecified,
+            MimeType::Specific("image/png"),
+        )
+        .unwrap();
+        assert_eq!(mime, "image/png");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_files(clipboard: &WaylandClipboard) -> (Vec<std::path::PathBuf>, PlatformRevision) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(files) = clipboard.observe_files().unwrap() {
+                return files;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for a native file observation"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_mime_types() -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let types = WaylandClipboard::capture_mime_types().unwrap();
+            if types.iter().any(|mime| mime == "image/png")
+                && types.iter().any(|mime| mime == "text/uri-list")
+            {
+                return types;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for image and file MIME types"
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CLIPMESH_ISOLATED_WAYLAND=1 and a private compositor"]
+    fn native_raw_png_capture_stages_owned_file_without_text_observation() {
+        assert_eq!(std::env::var("CLIPMESH_ISOLATED_WAYLAND").unwrap(), "1");
+        let mut clipboard = WaylandClipboard::connect().unwrap();
+        clipboard.write_text(b"synthetic baseline").unwrap();
+        publish_raw_png(ONE_BY_ONE_PNG);
+
+        let (paths, revision) = wait_for_files(&clipboard);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].extension().and_then(|ext| ext.to_str()),
+            Some("png")
+        );
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), ONE_BY_ONE_PNG);
+        assert!(clipboard.observe_text().unwrap().is_none());
+
+        // Repeated polling must reuse the owned staged path, not clone the
+        // image bytes or create a second temporary file.
+        assert_eq!(wait_for_files(&clipboard), (paths.clone(), revision));
+        assert!(paths[0].exists());
+
+        clipboard.write_text(b"cleanup").unwrap();
+        drop(clipboard);
+        assert!(!paths[0].exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CLIPMESH_ISOLATED_WAYLAND=1 and a private compositor"]
+    fn native_received_png_offers_file_and_image_without_echo() {
+        assert_eq!(std::env::var("CLIPMESH_ISOLATED_WAYLAND").unwrap(), "1");
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("received.png");
+        std::fs::write(&path, ONE_BY_ONE_PNG).unwrap();
+        let mut clipboard = WaylandClipboard::connect().unwrap();
+        let before = clipboard.write_text(b"synthetic baseline").unwrap();
+        let applied = clipboard
+            .write_files_if_current(std::slice::from_ref(&path), &before)
+            .unwrap()
+            .unwrap();
+
+        let types = wait_for_mime_types();
+        assert!(types
+            .iter()
+            .any(|mime| mime.starts_with("application/x-clipmesh-write-marker-")));
+        assert_eq!(read_current_png(), ONE_BY_ONE_PNG);
+        let (observed_paths, observed_revision) = wait_for_files(&clipboard);
+        assert_eq!(observed_paths, vec![path.clone()]);
+        assert_eq!(observed_revision, applied);
+        assert_eq!(std::fs::read(&observed_paths[0]).unwrap(), ONE_BY_ONE_PNG);
+        assert!(clipboard.observe_text().unwrap().is_none());
+
+        // A later local selection invalidates the old revision. The stale
+        // write must not publish a duplicate file selection.
+        clipboard.write_text(b"newer local text").unwrap();
+        assert!(clipboard
+            .write_files_if_current(std::slice::from_ref(&path), &observed_revision)
+            .unwrap()
+            .is_none());
+        assert!(clipboard.observe_files().unwrap().is_none());
+        assert_eq!(
+            clipboard.observe_text().unwrap().unwrap().bytes,
+            b"newer local text"
+        );
+    }
 
     struct ChunkedReader(VecDeque<Vec<u8>>);
 

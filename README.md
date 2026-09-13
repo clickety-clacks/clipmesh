@@ -25,9 +25,14 @@ paths. File metadata and transfers use the negotiated `clipmesh.files.v1`
 connection alongside the existing text protocol. Desktop receivers skip initial
 file history, suppress source echoes, and check clipboard revisions before
 applying downloaded files. Received bytes live in private local directories.
-Direct image clipboard formats on desktop are not yet converted into files;
-copy an image file in the file manager instead. These source capabilities do
-not establish what is installed on any machine.
+Linux Wayland captures direct `image/png` and `image/jpeg` clipboard offers into
+private temporary files. A native file selection keeps its original file URI
+and, for one supported image file, also offers `image/png` to the receiving
+desktop clipboard. PNG passes through after bounded header checks; GIF, HEIC,
+JPEG, TIFF, and WebP conversion requires `/usr/bin/magick`. Conversion is
+bounded and optional, so a failed or unavailable decoder leaves the file URI
+usable. These source capabilities do not establish what is installed on any
+machine.
 
 Rust is the default implementation language for the hub, protocol, and desktop
 agents. The Apple mobile client uses SwiftUI and native platform APIs.

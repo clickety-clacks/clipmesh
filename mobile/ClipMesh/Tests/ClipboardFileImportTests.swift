@@ -26,6 +26,45 @@ final class ClipboardFileImportTests: XCTestCase {
     }
 
     @MainActor
+    func testImageRepresentationWinsOverCaption() async throws {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 24))
+        let png = renderer.pngData { context in
+            UIColor.systemBlue.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+        }
+        let provider = NSItemProvider(object: "image caption" as NSString)
+        provider.suggestedName = "shared-image.png"
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(png, nil)
+            return nil
+        }
+
+        let result = try await LocalFileSelection.clipboardFiles([provider])
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].descriptor.media_type, "image/png")
+        XCTAssertEqual(result[0].data, png)
+    }
+
+    @MainActor
+    func testImageObjectProviderProducesPasteableImage() async throws {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 18, height: 12))
+        let image = renderer.image { context in
+            UIColor.systemRed.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 18, height: 12))
+        }
+        let provider = NSItemProvider(object: image)
+        provider.suggestedName = "shared-image"
+
+        let result = try await LocalFileSelection.clipboardFiles([provider])
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertTrue(result[0].descriptor.media_type.hasPrefix("image/"))
+        XCTAssertNotNil(UIImage(data: result[0].data))
+        XCTAssertTrue(result[0].descriptor.name.hasPrefix("shared-image"))
+    }
+
+    @MainActor
     func testFileURLImportsContentsInsteadOfPathText() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -41,10 +80,67 @@ final class ClipboardFileImportTests: XCTestCase {
     }
 
     @MainActor
+    func testBinaryClipboardProviderKeepsSuggestedExtension() async throws {
+        let provider = NSItemProvider()
+        provider.suggestedName = "export.custom"
+        let data = Data([0x00, 0x7F, 0xFF])
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.data.identifier, visibility: .all) { completion in
+            completion(data, nil)
+            return nil
+        }
+
+        let result = try await LocalFileSelection.clipboardFiles([provider])
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].descriptor.name, "export.custom")
+        XCTAssertEqual(result[0].data, data)
+    }
+
+    @MainActor
+    func testExplicitFileURLWinsOverImagePreviewRepresentation() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("source.png")
+        let source = UIGraphicsImageRenderer(size: CGSize(width: 14, height: 14)).pngData { context in
+            UIColor.systemGreen.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 14, height: 14))
+        }
+        try source.write(to: url)
+        let provider = NSItemProvider(item: url as NSURL, typeIdentifier: UTType.fileURL.identifier)
+        let preview = UIGraphicsImageRenderer(size: CGSize(width: 14, height: 14)).pngData { context in
+            UIColor.systemPurple.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: 14, height: 14))
+        }
+        provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { completion in
+            completion(preview, nil)
+            return nil
+        }
+
+        let result = try await LocalFileSelection.clipboardFiles([provider])
+
+        XCTAssertEqual(result.count, 1)
+        XCTAssertEqual(result[0].descriptor.name, "source.png")
+        XCTAssertEqual(result[0].data, source)
+    }
+
+    @MainActor
     func testTextProviderDoesNotBecomeAFile() async throws {
         let provider = NSItemProvider(object: "clipboard text" as NSString)
         let result = try await LocalFileSelection.clipboardFiles([provider])
         XCTAssertTrue(result.isEmpty)
+    }
+
+    @MainActor
+    func testNotesTextWithWebArchiveDoesNotBecomeAFile() async throws {
+        let provider = NSItemProvider(object: "Notes plain text" as NSString)
+        provider.registerDataRepresentation(forTypeIdentifier: "com.apple.webarchive", visibility: .all) { completion in
+            completion(Data("archive representation".utf8), nil)
+            return nil
+        }
+        let result = try await LocalFileSelection.clipboardFiles([provider])
+        XCTAssertTrue(result.isEmpty)
+        XCTAssertTrue(provider.canLoadObject(ofClass: NSString.self))
     }
 
     @MainActor

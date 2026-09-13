@@ -260,6 +260,7 @@ dependencies = [
  "toml",
  "tungstenite",
  "uuid",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

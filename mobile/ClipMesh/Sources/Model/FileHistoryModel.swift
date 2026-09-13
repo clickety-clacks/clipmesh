@@ -35,6 +35,12 @@ final class FileHistoryModel {
                     completion(data, nil)
                     return nil
                 }
+                // A data-only provider is not consistently offered as an
+                // image by every iOS consumer. Register the decoded object as
+                // well, while retaining the exact bytes for file-aware apps.
+                if type.conforms(to: .image), let image = UIImage(data: data) {
+                    provider.registerObject(image, visibility: .all)
+                }
                 return provider
             }
             pasteboard.setItemProviders(providers, localOnly: true, expirationDate: nil)

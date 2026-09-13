@@ -76,6 +76,22 @@ final class FileTransferIntegrationTests: XCTestCase {
         let automatic = try XCTUnwrap(observer.localFiles[imageID]?.first)
         XCTAssertEqual(try Data(contentsOf: automatic), image)
         XCTAssertTrue(observer.clips.contains { $0.id == imageID })
+        let imageClip = try XCTUnwrap(observer.clips.first { $0.id == imageID })
+        let imagePasteboard = UIPasteboard.withUniqueName()
+        defer { UIPasteboard.remove(withName: imagePasteboard.name) }
+        observer.copy(imageClip, to: imagePasteboard)
+        let imageProvider = try XCTUnwrap(imagePasteboard.itemProviders.first)
+        XCTAssertTrue(imageProvider.registeredTypeIdentifiers.contains {
+            UTType($0)?.conforms(to: .image) == true
+        })
+        let pastedImage: UIImage = try await withCheckedThrowingContinuation { continuation in
+            imageProvider.loadObject(ofClass: UIImage.self) { value, error in
+                if let value = value as? UIImage { continuation.resume(returning: value) }
+                else { continuation.resume(throwing: error ?? FileTransferFailure.invalidReply) }
+            }
+        }
+        XCTAssertEqual(pastedImage.cgImage?.width, UIImage(data: image)?.cgImage?.width)
+        XCTAssertEqual(pastedImage.cgImage?.height, UIImage(data: image)?.cgImage?.height)
 
         // A history reset must remove cached previews without disabling
         // future arrivals. Restart only after clear has stopped the old loop.
