@@ -133,7 +133,9 @@ final class ExplicitClipboardUITests: XCTestCase {
         }
         continueAfterFailure = false
         let sentText = "Notes UI test " + UUID().uuidString
+        let archiveName = "notes-webarchive-" + UUID().uuidString + ".webarchive"
         let provider = NSItemProvider(object: sentText as NSString)
+        provider.suggestedName = archiveName
         provider.registerDataRepresentation(forTypeIdentifier: "com.apple.webarchive", visibility: .all) { completion in
             completion(Data("web archive should not be sent".utf8), nil)
             return nil
@@ -170,8 +172,8 @@ final class ExplicitClipboardUITests: XCTestCase {
         let preview = app.buttons["latestClip"]
         XCTAssertTrue(preview.waitForExistence(timeout: 10))
         XCTAssertTrue(preview.label.contains(sentText))
-        let webArchiveRows = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", "webarchive"))
-        XCTAssertEqual(webArchiveRows.count, 0)
+        let archiveRows = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] %@", archiveName))
+        XCTAssertEqual(archiveRows.count, 0)
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline)
         app.terminate()
     }
