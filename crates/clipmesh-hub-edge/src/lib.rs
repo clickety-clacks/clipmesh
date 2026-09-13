@@ -666,8 +666,21 @@ impl RateBucket {
         let elapsed_ms = now_ms.saturating_sub(self.updated_at_ms);
         let refill = (elapsed_ms.saturating_mul(i64::from(per_minute)) / 60_000) as u32;
         if refill > 0 {
-            self.updated_at_ms = now_ms;
-            self.tokens = self.tokens.saturating_add(refill).min(burst);
+            let refill_elapsed_ms = i64::from(refill)
+                .saturating_mul(60_000)
+                .checked_div(i64::from(per_minute))
+                .unwrap_or(0);
+            let tokens = self.tokens.saturating_add(refill);
+            self.tokens = tokens.min(burst);
+            // Keep the fractional refill when the bucket is not full. This
+            // matters for a 30/minute bucket polled every three seconds:
+            // each poll earns 1.5 tokens, not one token with the remaining
+            // half silently discarded.
+            self.updated_at_ms = if self.tokens == burst {
+                now_ms
+            } else {
+                self.updated_at_ms.saturating_add(refill_elapsed_ms)
+            };
         }
         if self.tokens == 0 {
             return false;
@@ -2919,6 +2932,60 @@ mod tests {
         }
         assert!(!edge.consume_http_request(&peer, NOW));
         assert!(edge.consume_http_request(&peer, NOW + 500));
+    }
+
+    #[test]
+    fn rate_bucket_preserves_fractional_refill_between_requests() {
+        let mut bucket = RateBucket {
+            tokens: 0,
+            updated_at_ms: NOW,
+        };
+        assert!(bucket.take(NOW + 3_000, 30, 10));
+        // The first request earned 1.5 tokens. After it consumed one, the
+        // remaining half combines with the next second of refill to make the
+        // request at t=4s admissible. A floor-and-reset implementation would
+        // incorrectly reject it.
+        assert!(bucket.take(NOW + 4_000, 30, 10));
+    }
+
+    #[test]
+    fn depleted_connection_bucket_shares_three_second_poll_credit() {
+        let (_directory, _daemon, edge) = edge();
+        let peer = StablePeerId::from_boundary("peer-reserved-example".to_owned()).unwrap();
+        for _ in 0..10 {
+            assert!(edge.consume_connection_attempt(&peer, NOW));
+        }
+        // This models the desktop file poll followed one second later by a
+        // fresh mobile launch. With fractional refill, both can progress even
+        // after the initial burst has been consumed.
+        for cycle in 1..=4 {
+            let desktop_poll = NOW + cycle * 3_000;
+            assert!(edge.consume_connection_attempt(&peer, desktop_poll));
+            // The spare request is deliberately every other poll, which is
+            // the available 10/minute headroom after the desktop's 20/minute
+            // cadence. Asking every poll would exceed the configured 30/min
+            // rate and should remain rejected.
+            if cycle % 2 == 1 {
+                assert!(edge.consume_connection_attempt(&peer, desktop_poll + 1_000));
+            }
+        }
+    }
+
+    #[test]
+    fn connection_bucket_caps_long_idle_refill_at_burst() {
+        let (_directory, _daemon, edge) = edge();
+        let peer = StablePeerId::from_boundary("peer-reserved-example".to_owned()).unwrap();
+        for _ in 0..10 {
+            assert!(edge.consume_connection_attempt(&peer, NOW));
+        }
+        assert!(edge.consume_connection_attempt(&peer, NOW + 60_000));
+        for _ in 0..9 {
+            assert!(edge.consume_connection_attempt(&peer, NOW + 60_000));
+        }
+        assert!(!edge.consume_connection_attempt(&peer, NOW + 60_000));
+        // Once the saturated bucket has been drained, normal refill resumes
+        // from the time it reached its cap rather than from the old timestamp.
+        assert!(edge.consume_connection_attempt(&peer, NOW + 62_000));
     }
 
     #[test]
