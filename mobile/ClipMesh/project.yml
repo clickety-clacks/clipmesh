@@ -26,6 +26,7 @@ targets:
           - App/Info.plist
     settings:
       base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_IDENTITY: ""
         CURRENT_PROJECT_VERSION: 1
         INFOPLIST_FILE: Sources/App/Info.plist

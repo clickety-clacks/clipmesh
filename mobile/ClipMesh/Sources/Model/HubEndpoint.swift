@@ -27,6 +27,13 @@ struct HubEndpoint: Equatable {
         url.absoluteString
     }
 
+    func httpURL(path: String) -> URL {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        components.scheme = "http"
+        components.path = path
+        return components.url!
+    }
+
     private static func isTailnetNodeAddress(_ host: String) -> Bool {
         if let address = IPv4Address(host) {
             let bytes = [UInt8](address.rawValue)

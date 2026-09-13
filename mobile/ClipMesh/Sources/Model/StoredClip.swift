@@ -5,15 +5,20 @@ struct StoredClip: Equatable {
     let cursor: UInt64
     let acceptedAtMilliseconds: Int64
     let expiresAtMilliseconds: Int64
+    let sourcePeerID: String
+    let searchableContent: String
     let content: ClipContentV1
     var isStale: Bool
 
-    var presentation: HistoryRowPresentation {
+    func presentation(machineNames: [String: String]) -> HistoryRowPresentation {
         HistoryRowPresentation(
             id: messageID,
             cursor: cursor,
             acceptedAt: Date(timeIntervalSince1970: Double(acceptedAtMilliseconds) / 1000),
             preview: content.preview(maximumScalars: 160),
+            searchableContent: searchableContent,
+            sourcePeerID: sourcePeerID,
+            sourceMachineName: machineNames[sourcePeerID] ?? "Unknown machine",
             isStale: isStale,
         )
     }

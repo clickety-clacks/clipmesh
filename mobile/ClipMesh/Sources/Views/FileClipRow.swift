@@ -5,6 +5,7 @@ struct FileClipRow: View {
     let clip: MeshFileClip
     let files: FileHistoryModel
     let endpoint: String
+    let machineName: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -15,12 +16,19 @@ struct FileClipRow: View {
                 }
                 Label(file.name, systemImage: file.media_type.hasPrefix("video/") ? "film" : file.media_type.hasPrefix("image/") ? "photo" : "doc")
                     .lineLimit(2)
+                    .padding(.horizontal, 16)
             }
+            Text("From \(machineName)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
             if let urls = files.localFiles[clip.id] {
                 Button("Copy", systemImage: "doc.on.doc") { files.copy(clip) }
                     .buttonStyle(.borderless)
+                    .padding(.horizontal, 16)
                 ShareLink(items: urls) { Label("Share", systemImage: "square.and.arrow.up") }
                     .buttonStyle(.borderless)
+                    .padding(.horizontal, 16)
             } else {
                 Button {
                     Task { await files.download(clip, endpoint: endpoint) }
@@ -28,10 +36,12 @@ struct FileClipRow: View {
                     if files.downloading.contains(clip.id) { ProgressView() }
                     else { Label("Download", systemImage: "arrow.down.circle") }
                 }
+                .padding(.horizontal, 16)
                 .disabled(!files.downloading.isEmpty)
             }
             Text(Date(timeIntervalSince1970: Double(clip.accepted_at) / 1000), style: .relative)
                 .font(.caption).foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
         }
         .padding(.vertical, 12)
     }

@@ -4,6 +4,11 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class ExplicitClipboardUITests: XCTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        XCUIDevice.shared.orientation = .portrait
+    }
+
     func testImagePreviewSendAndThumbnailCopy() throws {
         let endpoint = ProcessInfo.processInfo.environment["CLIPMESH_TEST_HUB_URL"] ?? ""
         guard endpoint.hasPrefix("ws://") else { throw XCTSkip("Requires an isolated test hub") }
@@ -34,12 +39,16 @@ final class ExplicitClipboardUITests: XCTestCase {
         XCTAssertTrue(send.label.contains(name))
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline)
         send.tap()
-        XCTAssertTrue(app.staticTexts["Sent to ClipMesh"].waitForExistence(timeout: 15))
+        let sentFeedback = app.staticTexts["clipboardFeedback"]
+        XCTAssertTrue(sentFeedback.waitForExistence(timeout: 15))
+        XCTAssertEqual(sentFeedback.label, "Sent to ClipMesh")
         let thumbnail = app.buttons["copyFileThumbnail-" + name]
         XCTAssertTrue(thumbnail.waitForExistence(timeout: 20))
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline, "Arrival must not write the clipboard")
         thumbnail.tap()
-        XCTAssertTrue(app.staticTexts["Copied to device clipboard"].waitForExistence(timeout: 5))
+        let copiedFeedback = app.staticTexts["fileFeedback"]
+        expectation(for: NSPredicate(format: "label == %@", "Copied to device clipboard"), evaluatedWith: copiedFeedback)
+        waitForExpectations(timeout: 5)
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline + 1)
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "File preview and chronological clippings"
@@ -49,8 +58,11 @@ final class ExplicitClipboardUITests: XCTestCase {
         defer { XCUIDevice.shared.orientation = .portrait }
         expectation(for: NSPredicate { _, _ in app.frame.width > app.frame.height }, evaluatedWith: app)
         waitForExpectations(timeout: 10)
+        scrollHistoryToTop(app)
         XCTAssertTrue(send.isHittable)
-        XCTAssertTrue(app.staticTexts["Live"].exists)
+        let status = app.staticTexts["connectionStatus"].firstMatch
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertTrue(status.label.contains("Live"))
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline + 1, "Rotation must not write the clipboard")
         let landscape = XCTAttachment(screenshot: app.screenshot())
         landscape.name = "Landscape clipping list"
@@ -178,9 +190,51 @@ final class ExplicitClipboardUITests: XCTestCase {
         app.terminate()
     }
 
+    func testNativeSearchFindsFullTextAndMachineName() throws {
+        let endpoint = ProcessInfo.processInfo.environment["CLIPMESH_TEST_HUB_URL"] ?? ""
+        guard endpoint.hasPrefix("ws://") else { throw XCTSkip("Requires an isolated test hub") }
+        continueAfterFailure = false
+        let marker = "search-tail-" + UUID().uuidString
+        let longText = String(repeating: "history prefix ", count: 20) + marker
+        UIPasteboard.general.string = longText
+        let app = XCUIApplication()
+        app.launchArguments = ["-hub_url", endpoint]
+        addUIInterruptionMonitor(withDescription: "Paste permission") { alert in
+            if alert.buttons["Allow Paste"].exists { alert.buttons["Allow Paste"].tap(); return true }
+            if alert.buttons["Allow"].exists { alert.buttons["Allow"].tap(); return true }
+            return false
+        }
+        app.launch()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let permission = springboard.alerts.buttons["Allow Paste"]
+        if permission.waitForExistence(timeout: 5) { permission.tap() }
+        let send = app.buttons["copyToClipMesh"]
+        XCTAssertTrue(send.waitForExistence(timeout: 15))
+        expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: send)
+        waitForExpectations(timeout: 15)
+        send.tap()
+        XCTAssertTrue(app.staticTexts["Copied to ClipMesh"].waitForExistence(timeout: 15))
+
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 10))
+        search.tap()
+        search.typeText(marker)
+        XCTAssertTrue(app.buttons["latestClip"].waitForExistence(timeout: 10))
+        search.buttons["Clear text"].tap()
+        let sourceName = ProcessInfo.processInfo.environment["CLIPMESH_TEST_SOURCE_NAME"] ?? "eezo"
+        search.typeText(sourceName)
+        XCTAssertTrue(app.staticTexts["From \(sourceName)"].waitForExistence(timeout: 10))
+        app.terminate()
+    }
+
     private func scrollHistoryToTop(_ app: XCUIApplication) {
+        let collection = app.collectionViews.firstMatch
+        if collection.waitForExistence(timeout: 5) {
+            for _ in 0 ..< 6 { collection.swipeDown() }
+            return
+        }
         let scrollView = app.scrollViews.firstMatch
         guard scrollView.waitForExistence(timeout: 5) else { return }
-        for _ in 0 ..< 5 { scrollView.swipeDown() }
+        for _ in 0 ..< 6 { scrollView.swipeDown() }
     }
 }

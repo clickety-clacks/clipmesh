@@ -10,7 +10,9 @@ Success appears only after the hub accepts the clip. An uncertain result is
 reported as uncertain, without an automatic retry.
 
 Tap the latest preview or a history row to copy retained text to the device.
-This version supports text, not images or files.
+Choose files from the attachment menu to send images and other files. File
+history offers previews, download, copy, and share actions. History rows keep
+their source machine name and can be searched by text, filename, or machine.
 
 ## Build and test
 

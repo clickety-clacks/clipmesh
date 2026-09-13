@@ -11,6 +11,7 @@ final class MobileSessionModel {
     private(set) var pendingPublishID: UUID?
     private(set) var isSendingFiles = false
     private(set) var historyResetID = UUID()
+    private(set) var machineNames: [String: String] = [:]
     @ObservationIgnored private var fileClient: FileTransferClient?
     @ObservationIgnored private var publishTask: Task<Void, Never>?
     var hubURLText: String
@@ -118,6 +119,12 @@ final class MobileSessionModel {
     func clearLocalHistory() {
         historyResetID = UUID()
         storedHistory.removeAll()
+        updateVisibleHistory()
+    }
+
+    func setMachineNames(_ names: [String: String]) {
+        guard machineNames != names else { return }
+        machineNames = names
         updateVisibleHistory()
     }
 
@@ -447,6 +454,8 @@ final class MobileSessionModel {
                     cursor: value.cursor,
                     acceptedAtMilliseconds: value.acceptedAtMilliseconds,
                     expiresAtMilliseconds: value.expiresAtMilliseconds,
+                    sourcePeerID: value.sourcePeerID,
+                    searchableContent: value.content.toPlatform(),
                     content: value.content,
                     isStale: lifecycleState != .foregroundLive,
                 ),
@@ -626,7 +635,7 @@ final class MobileSessionModel {
     }
 
     private func updateVisibleHistory() {
-        visibleHistory = storedHistory.map(\.presentation)
+        visibleHistory = storedHistory.map { $0.presentation(machineNames: machineNames) }
     }
 
     private func sortAndTrimHistory() {

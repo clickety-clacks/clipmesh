@@ -17,6 +17,7 @@ struct ContentView: View {
     @State private var fileImportError: String?
     @State private var fileHistory = FileHistoryModel()
     @State private var appliedHistoryResetID: UUID?
+    @State private var searchText = ""
 
     private enum Clipping: Identifiable {
         case text(HistoryRowPresentation), files(MeshFileClip)
@@ -32,11 +33,33 @@ struct ContentView: View {
             case let .files(row): Date(timeIntervalSince1970: Double(row.accepted_at) / 1000)
             }
         }
+
+        func matches(_ query: String, machineNames: [String: String], fileSourcePeerIDs: [UUID: String]) -> Bool {
+            switch self {
+            case let .text(row):
+                return row.matches(query)
+            case let .files(clip):
+                let machine = fileSourcePeerIDs[clip.id].flatMap { machineNames[$0] } ?? "Unknown machine"
+                let names = clip.manifest.files.map(\.name).joined(separator: " ")
+                return [names, machine].joined(separator: " ").localizedStandardContains(query)
+            }
+        }
     }
 
     private var clippings: [Clipping] {
-        (model.visibleHistory.map(Clipping.text) + fileHistory.clips.map(Clipping.files))
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let all = (model.visibleHistory.map(Clipping.text) + fileHistory.clips.map(Clipping.files))
+        let machineNames = mergedMachineNames
+        let fileSourcePeerIDs = fileHistory.fileSourcePeerIDs
+        let matching = query.isEmpty ? all : all.filter {
+            $0.matches(query, machineNames: machineNames, fileSourcePeerIDs: fileSourcePeerIDs)
+        }
+        return matching
             .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
+    }
+
+    private var mergedMachineNames: [String: String] {
+        model.machineNames.merging(fileHistory.machineNames) { _, fileName in fileName }
     }
 
     var body: some View {
@@ -47,36 +70,7 @@ struct ContentView: View {
                         if selectedFiles.isEmpty { await model.finishExplicitClipboardRead(clipboardText) }
                         else { await model.sendFiles(selectedFiles) }
                     }
-                } label: {
-                    VStack(alignment: .leading, spacing: 16) {
-                        if isReadingClipboard || model.isSendingFiles {
-                            ProgressView()
-                        } else if !selectedFiles.isEmpty {
-                            ForEach(selectedFiles) { file in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    if let thumbnail = file.thumbnail {
-                                        Image(uiImage: thumbnail).resizable().scaledToFit().frame(maxHeight: 220)
-                                    } else {
-                                        Image(systemName: "doc").font(.largeTitle)
-                                    }
-                                    Text(file.descriptor.name).lineLimit(2)
-                                    Text(ByteCountFormatter.string(fromByteCount: Int64(file.descriptor.size_bytes), countStyle: .file))
-                                        .font(.caption)
-                                }
-                            }
-                        } else if let clipboardText {
-                            Text(clipboardText).lineLimit(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        } else {
-                            Image(systemName: "clipboard").font(.largeTitle)
-                        }
-                        Label("Send", systemImage: "arrow.up")
-                            .font(.headline)
-                    }
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, minHeight: 100, alignment: .leading)
-                    .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
-                }
+                } label: { sendCard }
                 .buttonStyle(.plain)
                 .listRowBackground(colorScheme == .dark ? Color.white : Color.black)
                 .accessibilityIdentifier("copyToClipMesh")
@@ -87,21 +81,31 @@ struct ContentView: View {
                 if let feedback = model.actionFeedback {
                     Text(feedback).font(.callout).accessibilityIdentifier("clipboardFeedback")
                 }
-                if let feedback = fileHistory.feedback { Text(feedback).font(.callout) }
+                if let feedback = fileHistory.feedback {
+                    Text(feedback).font(.callout).accessibilityIdentifier("fileFeedback")
+                }
 
                 ForEach(clippings) { clipping in
                     switch clipping {
                     case let .files(clip):
-                        FileClipRow(clip: clip, files: fileHistory, endpoint: model.hubURLText)
+                        FileClipRow(
+                            clip: clip,
+                            files: fileHistory,
+                            endpoint: model.hubURLText,
+                            machineName: fileHistory.fileSourcePeerIDs[clip.id].flatMap { mergedMachineNames[$0] } ?? "Unknown machine",
+                        )
                     case let .text(row):
                     Button { model.copyHistoryItem(row.id) } label: {
                         VStack(alignment: .leading, spacing: 12) {
                             Text(row.preview).lineLimit(8)
+                            Text("From \(row.sourceMachineName)")
+                                .font(.subheadline).foregroundStyle(.secondary)
                             Text(row.acceptedAt, style: .relative)
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 12)
+                        .padding(.horizontal, 16)
                     }
                     .buttonStyle(.plain)
                     .accessibilityIdentifier(row.id == model.visibleHistory.first?.id ? "latestClip" : "historyClip")
@@ -109,9 +113,11 @@ struct ContentView: View {
                 }
                 if let error = fileHistory.error { Text(error).font(.callout) }
             }
-                .listStyle(.insetGrouped)
-                .navigationTitle("ClipMesh")
+                .listStyle(.plain)
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                .contentMargins(.horizontal, 0, for: .scrollContent)
                 .navigationBarTitleDisplayMode(.inline)
+                .searchable(text: $searchText, placement: .toolbar, prompt: "Search history")
                 .task(id: "\(model.lifecycleState)-\(model.historyResetID)") {
                     // Clear before starting the replacement observer. Separate
                     // onChange/task handlers could stop the new observer.
@@ -127,7 +133,20 @@ struct ContentView: View {
                         Task { await fileHistory.refresh(endpoint: model.hubURLText) }
                     }
                 }
+                .onChange(of: fileHistory.machineNames) { _, names in
+                    model.setMachineNames(names)
+                }
+                .onChange(of: model.visibleHistory) { _, _ in
+                    let textPeerIDs = Set(model.visibleHistory.map(\.sourcePeerID))
+                    Task {
+                        await fileHistory.refreshSourceMetadata(
+                            endpoint: model.hubURLText,
+                            textPeerIDs: textPeerIDs,
+                        )
+                    }
+                }
                 .onChange(of: scenePhase, initial: true) { _, phase in
+                    if phase != .active { searchText = "" }
                     if phase == .active { refreshClipboardPreview() }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIPasteboard.changedNotification)) { _ in
@@ -137,6 +156,7 @@ struct ContentView: View {
                     ToolbarItem(placement: .topBarLeading) {
                         ConnectionStatusView(state: model.lifecycleState, errorCode: model.errorCode)
                     }
+                    .sharedBackgroundVisibility(.hidden)
                     ToolbarItemGroup(placement: .topBarTrailing) {
                         Menu("Add files", systemImage: "paperclip") {
                             Button("Choose files", systemImage: "folder") { isChoosingFiles = true }
@@ -187,6 +207,39 @@ struct ContentView: View {
 
     private func showSettings() {
         isShowingSettings = true
+    }
+
+    @ViewBuilder
+    private var sendCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if isReadingClipboard || model.isSendingFiles {
+                ProgressView()
+            } else if !selectedFiles.isEmpty {
+                ForEach(selectedFiles) { file in
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let thumbnail = file.thumbnail {
+                            Image(uiImage: thumbnail).resizable().scaledToFit().frame(maxHeight: 220)
+                        } else {
+                            Image(systemName: "doc").font(.largeTitle)
+                        }
+                        Text(file.descriptor.name).lineLimit(2)
+                        Text(ByteCountFormatter.string(fromByteCount: Int64(file.descriptor.size_bytes), countStyle: .file))
+                            .font(.caption)
+                    }
+                }
+            } else if let clipboardText {
+                Text(clipboardText).lineLimit(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Image(systemName: "clipboard").font(.largeTitle)
+            }
+            Label("Send", systemImage: "arrow.up")
+                .font(.headline)
+        }
+        .padding(.vertical, 12)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, minHeight: 100, alignment: .leading)
+        .foregroundStyle(colorScheme == .dark ? Color.black : Color.white)
     }
 
     private func refreshClipboardPreview() {

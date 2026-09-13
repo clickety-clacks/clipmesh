@@ -10,6 +10,9 @@ struct ConnectionStatusView: View {
             .fixedSize()
             .font(.footnote)
             .foregroundStyle(state == .foregroundError ? .red : .secondary)
+            .accessibilityLabel("Connection status: \(title)")
+            .accessibilityIdentifier("connectionStatus")
+            .accessibilityAddTraits(.isStaticText)
     }
 
     private var title: String {

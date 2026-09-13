@@ -45,6 +45,37 @@ struct MeshFileClip: Codable, Identifiable, Equatable {
     var id: UUID { clip_id }
 }
 
+struct MeshMachine: Equatable {
+    let peerID: String
+    let name: String
+}
+
+struct MeshMachineDirectory: Equatable {
+    let namesByPeerID: [String: String]
+    let fileSourcePeerIDs: [UUID: String]
+}
+
+private let maximumSourceMetadataPeers = 1_024
+private let maximumSourceMetadataFileSources = 500
+
+enum MetadataHTTPFailure: Error {
+    case status(Int)
+    case invalidReply
+    case responseTooLarge
+}
+
+private final class MetadataRedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void,
+    ) {
+        completionHandler(nil)
+    }
+}
+
 enum FileTransferFailure: Error {
     case disconnected, invalidReply, rejected, busy, integrity, limit
 }
@@ -96,6 +127,91 @@ final class FileTransferClient {
         }
         for clip in decoded { try clip.manifest.validate() }
         return decoded
+    }
+
+    /// Ask the additive HTTP metadata endpoint for display names and file
+    /// provenance. The deployed file WebSocket contract remains unchanged.
+    static func sourceMetadata(endpoint: HubEndpoint) async throws -> MeshMachineDirectory {
+        let object = try await metadataObject(endpoint: endpoint, path: "/v1/source-metadata")
+        return try decodeSourceMetadata(object)
+    }
+
+    static func decodeSourceMetadata(_ object: [String: Any]) throws -> MeshMachineDirectory {
+        guard object["protocol_version"] as? Int == 1,
+              object["type"] as? String == "source_metadata",
+              let rawMachines = object["peers"] as? [[String: Any]]
+        else { throw MetadataHTTPFailure.invalidReply }
+        guard rawMachines.count <= maximumSourceMetadataPeers else {
+            throw MetadataHTTPFailure.invalidReply
+        }
+        var result: [MeshMachine] = []
+        var seen: Set<String> = []
+        for raw in rawMachines {
+            let peerID = raw["id"] as? String
+            let name = raw["display_name"] as? String
+            guard raw.keys.count == 2,
+                  raw.keys.contains("id"), raw.keys.contains("display_name"),
+                  let peerID, !peerID.isEmpty, peerID.utf8.count <= 512,
+                  !peerID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  let name, !name.isEmpty, name.utf8.count <= 512,
+                  !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  seen.insert(peerID).inserted else {
+                throw MetadataHTTPFailure.invalidReply
+            }
+            result.append(MeshMachine(peerID: peerID, name: name))
+        }
+        var fileSources: [UUID: String] = [:]
+        guard let rawFileSources = object["file_sources"] as? [[String: Any]] else {
+            throw MetadataHTTPFailure.invalidReply
+        }
+        guard rawFileSources.count <= maximumSourceMetadataFileSources else {
+            throw MetadataHTTPFailure.invalidReply
+        }
+        for raw in rawFileSources {
+            guard let clipText = raw["clip_id"] as? String,
+                  let clipID = UUID(uuidString: clipText),
+                  clipID.uuidString.lowercased() == clipText,
+                  let peerID = raw["source_peer_id"] as? String,
+                  !peerID.isEmpty, peerID.utf8.count <= 512,
+                  !peerID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  raw.keys.count == 2,
+                  raw.keys.contains("clip_id"), raw.keys.contains("source_peer_id"),
+                  fileSources[clipID] == nil else { throw MetadataHTTPFailure.invalidReply }
+            fileSources[clipID] = peerID
+        }
+        return MeshMachineDirectory(
+            namesByPeerID: Dictionary(uniqueKeysWithValues: result.map { ($0.peerID, $0.name) }),
+            fileSourcePeerIDs: fileSources,
+        )
+    }
+
+    private static func metadataObject(endpoint: HubEndpoint, path: String) async throws -> [String: Any] {
+        var request = URLRequest(url: endpoint.httpURL(path: path), cachePolicy: .reloadIgnoringLocalCacheData)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCredentialStorage = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForResource = 10
+        let session = URLSession(configuration: configuration, delegate: MetadataRedirectBlocker(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let http = response as? HTTPURLResponse else { throw MetadataHTTPFailure.invalidReply }
+        guard http.statusCode == 200 else { throw MetadataHTTPFailure.status(http.statusCode) }
+        var data = Data()
+        data.reserveCapacity(4096)
+        for try await byte in bytes {
+            guard data.count < 1024 * 1024 else { throw MetadataHTTPFailure.responseTooLarge }
+            data.append(byte)
+        }
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MetadataHTTPFailure.invalidReply
+        }
+        guard object["protocol_version"] as? Int == 1 else { throw MetadataHTTPFailure.invalidReply }
+        return object
     }
 
     func send(_ files: [(MeshFileDescriptor, Data)], clipID: UUID = UUID()) async throws {
