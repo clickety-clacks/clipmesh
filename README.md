@@ -1,73 +1,51 @@
 # ClipMesh
 
-ClipMesh is a small, private, cross-platform clipboard mesh designed for
-machines already connected by a trusted overlay network such as Tailscale.
+Copy on one device, paste on another. ClipMesh shares text, images, and files
+between your Linux, Mac, iPhone, and iPad devices over your private Tailscale network.
 
-Desktop agents automatically exchange clipboard text and native file selections
-through a hub. macOS reads file URLs from the pasteboard; Linux reads explicit
-Wayland `text/uri-list` offers. A path copied as ordinary text remains text. The
-iOS/iPadOS app supports text and file selections. Its first row previews the
-device clipboard with an inverted background and a Send action. Opening the
-app reads that preview but does not send anything or write to the clipboard.
-iOS may request paste permission while preparing the preview.
+## What you need
 
-Tap Send to publish the displayed content. The paperclip menu also lets you
-choose files. Received files offer Copy and Share, and image/video files show
-thumbnails after download. Tapping a downloaded thumbnail copies the selection.
-Sending reports success only after the hub accepts the whole selection.
-The app uses a scrolling SwiftUI List with native floating toolbars.
+Run the ClipMesh server, called the hub, on one computer and a client on each
+device you want to use. All devices need access to the same hub through Tailscale.
+The hub keeps shared clipboard history and transfers files between your devices.
+Linux requires a Wayland desktop.
 
-File transfer currently supports up to 32 files per clipping, 100 MiB per file,
-and 500 MiB per selection. The hub reserves at most 1 GiB of file payloads;
-the mobile download cache is limited to 500 MiB. Directories are not accepted.
-Files travel as bytes with SHA-256 verification, never as remote filesystem
-paths. File metadata and transfers use the negotiated `clipmesh.files.v1`
-connection alongside the existing text protocol. Desktop receivers skip initial
-file history, suppress source echoes, and check clipboard revisions before
-applying downloaded files. Received bytes live in private local directories.
-Linux Wayland captures direct `image/png` and `image/jpeg` clipboard offers into
-private temporary files. A native file selection keeps its original file URI
-and, for one supported image file, also offers `image/png` to the receiving
-desktop clipboard. PNG passes through after bounded header checks; GIF, HEIC,
-JPEG, TIFF, and WebP conversion requires `/usr/bin/magick`. Conversion is
-bounded and optional, so a failed or unavailable decoder leaves the file URI
-usable. These source capabilities do not establish what is installed on any
-machine.
+## Getting started
 
-Rust is the default implementation language for the hub, protocol, and desktop
-agents. The Apple mobile client uses SwiftUI and native platform APIs.
+1. Get ClipMesh from the [project repository](https://github.com/clickety-clacks/clipmesh).
+   Installation currently requires building from source; there is no packaged download yet.
+2. Connect your devices to the same Tailscale network.
+3. Set up the hub on a computer that will stay available. Configure its Tailscale
+   address and storage location, then start it with `clipmesh-hub --config <hub.toml>`.
+4. Connect each client to that hub using `ws://<hub-tailscale-ip>:<port>/v1/stream`.
+   On Linux and Mac, set `hub_url` in the client configuration and start
+   `clipmesh-agent --config <agent.toml>`. On iPhone and iPad, enter the URL in
+   ClipMesh's Connection settings and tap Save.
+5. Copy a short piece of text on one desktop and paste it on another. On iPhone
+   or iPad, tap Send to share text, or tap a history entry to copy it.
 
-See [the product intent](docs/initial-spirit.md) for the accepted MVP policy and
-its canonical reviewed specification reference.
+Setup references: [hub and client configuration](https://github.com/clickety-clacks/clipmesh/tree/main/deploy/config),
+[Linux service setup](https://github.com/clickety-clacks/clipmesh/tree/main/deploy/systemd),
+[Mac service setup](https://github.com/clickety-clacks/clipmesh/tree/main/deploy/launchd),
+and [iPhone and iPad build instructions](https://github.com/clickety-clacks/clipmesh/tree/main/mobile/ClipMesh).
+The desktop references provide service templates, not automatic installers.
 
-## Status
+## On Linux and Mac
 
-`main` contains the current implementation and is the default development
-target. The former `0.1.0` quarantine-only policy and separate quarantine-to-main
-approval gate no longer apply (Mike's source-development ruling, 2026-09-05).
-Existing branches remain preserved. Source development does not authorize
-release publication, permanent installation, or deployment.
+Copy text, an image, or files as you normally would. ClipMesh sends the item to
+your other connected desktops so you can paste it there.
 
-The mobile project is [mobile/ClipMesh/ClipMesh.xcodeproj](mobile/ClipMesh/ClipMesh.xcodeproj).
-Live acceptance remains partial; availability on `main` is not a full-acceptance
-or release claim.
+Copy the files themselves in your file manager to send them. Copying a filename
+or path as text sends only that text. Connecting a desktop does not replace its
+clipboard with previously shared files.
 
-The immutable Rust protocol foundation, the remediated transport-neutral hub
-policy core, the persistent desktop domain core, and the explicit Tailnet hub
-and desktop agent executables are present. The desktop core provides outbox,
-resume, clear-generation, local-control, revision-marker, and synthetic
-adapter seams without opening a network or platform listener. The edge validates a
-configured Tailnet self address through LocalAPI, resolves each accepted
-socket with WhoIs before HTTP parsing, and holds the hub event lease through
-complete WebSocket-frame output. The `clipmesh-hub` binary is its only explicit
-bind-and-serve boundary. The `clipmesh-agent` binary admits a numeric Tailnet
-endpoint before transport, composes the native platform adapter, resumes to
-live, and reconnects with full jitter. The hub core provides SQLite-only
-ordering, retry, resume, acknowledgement, retention, shared clear, and
-canonical clip-content custody.
+## On iPhone and iPad
 
-The Linux Wayland and macOS native clipboard and lock-state adapters,
-owner-only Unix control seams, inactive generic systemd and launchd templates,
-closed configuration templates, and render-only Ansible assets are present.
-Installation, service loading or activation, deployment, listener activation,
-and private topology remain outside this repository slice.
+Open ClipMesh and tap Send to share the clipboard preview. You can also choose
+files from the paperclip menu. Opening the app does not send anything or replace
+your clipboard, though iOS may ask for permission to read the preview.
+
+To receive something, find it in the shared history and tap it to copy. Files
+have Copy and Share actions after downloading. You can also tap an image thumbnail
+to copy it. Entries show the device they came from, and search finds text,
+filenames, and device names.
