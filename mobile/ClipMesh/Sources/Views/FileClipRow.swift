@@ -7,14 +7,52 @@ struct FileClipRow: View {
     let endpoint: String
     let machineName: String
 
+    @State private var sharePresentation: SharePresentation?
+    @State private var isSavingToPhotos = false
+    @State private var saveStatus: SaveStatus?
+
+    private enum SaveStatus {
+        case success(String)
+        case failure(String)
+
+        var message: String {
+            switch self {
+            case let .success(message), let .failure(message): message
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .success: "checkmark.circle"
+            case .failure: "exclamationmark.triangle"
+            }
+        }
+
+        var isFailure: Bool {
+            if case .failure = self { return true }
+            return false
+        }
+    }
+
+    private struct SharePresentation: Identifiable {
+        let id = UUID()
+        let items: [Any]
+    }
+
+    private var saveableMedia: [PhotoLibrarySaveItem] {
+        guard let urls = files.localFiles[clip.id] else { return [] }
+        return PhotoLibrarySaver.saveItems(urls: urls, descriptors: clip.manifest.files)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             ForEach(Array(clip.manifest.files.enumerated()), id: \.offset) { index, file in
-                if file.media_type.hasPrefix("image/") || file.media_type.hasPrefix("video/"),
+                let mediaType = file.media_type.lowercased()
+                if mediaType.hasPrefix("image/") || mediaType.hasPrefix("video/"),
                    let urls = files.localFiles[clip.id], urls.indices.contains(index) {
                     FileThumbnail(url: urls[index], name: file.name) { files.copy(clip) }
                 }
-                Label(file.name, systemImage: file.media_type.hasPrefix("video/") ? "film" : file.media_type.hasPrefix("image/") ? "photo" : "doc")
+                Label(file.name, systemImage: mediaType.hasPrefix("video/") ? "film" : mediaType.hasPrefix("image/") ? "photo" : "doc")
                     .lineLimit(2)
                     .padding(.horizontal, 16)
             }
@@ -26,9 +64,37 @@ struct FileClipRow: View {
                 Button("Copy", systemImage: "doc.on.doc") { files.copy(clip) }
                     .buttonStyle(.borderless)
                     .padding(.horizontal, 16)
-                ShareLink(items: urls) { Label("Share", systemImage: "square.and.arrow.up") }
+                HStack(spacing: 16) {
+                    Button("Share", systemImage: "square.and.arrow.up") {
+                        sharePresentation = SharePresentation(items: urls.map { $0 as Any })
+                    }
                     .buttonStyle(.borderless)
-                    .padding(.horizontal, 16)
+                    .accessibilityIdentifier("shareFiles-" + clip.id.uuidString)
+
+                    if !saveableMedia.isEmpty {
+                        Button {
+                            saveToPhotos(saveableMedia)
+                        } label: {
+                            if isSavingToPhotos {
+                                ProgressView()
+                            } else {
+                                Label("Save to Photos", systemImage: "photo.badge.arrow.down")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(isSavingToPhotos)
+                        .accessibilityIdentifier("saveToPhotos-" + clip.id.uuidString)
+                    }
+                }
+                .padding(.horizontal, 16)
+
+                if let saveStatus {
+                    Label(saveStatus.message, systemImage: saveStatus.systemImage)
+                        .font(.callout)
+                        .foregroundStyle(saveStatus.isFailure ? .red : .secondary)
+                        .padding(.horizontal, 16)
+                        .accessibilityIdentifier("photosSaveFeedback-" + clip.id.uuidString)
+                }
             } else {
                 Button {
                     Task { await files.download(clip, endpoint: endpoint) }
@@ -44,6 +110,30 @@ struct FileClipRow: View {
                 .padding(.horizontal, 16)
         }
         .padding(.vertical, 12)
+        .sheet(item: $sharePresentation) { presentation in
+            ClipMeshShareSheet(activityItems: presentation.items)
+                .presentationDetents([.large])
+                .presentationSizing(.page)
+                .presentationDragIndicator(.visible)
+        }
+    }
+
+    private func saveToPhotos(_ items: [PhotoLibrarySaveItem]) {
+        isSavingToPhotos = true
+        saveStatus = nil
+        Task { @MainActor in
+            defer { isSavingToPhotos = false }
+            do {
+                try await PhotoLibrarySaver.save(items)
+                let count = items.count
+                let noun = count == 1 ? "item" : "items"
+                saveStatus = .success("Saved \(count) \(noun) to Photos")
+            } catch let error as PhotoLibrarySaveError {
+                saveStatus = .failure(error.userMessage)
+            } catch {
+                saveStatus = .failure(PhotoLibrarySaveError.saveFailed.userMessage)
+            }
+        }
     }
 }
 
