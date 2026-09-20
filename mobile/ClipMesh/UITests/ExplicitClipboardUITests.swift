@@ -50,6 +50,34 @@ final class ExplicitClipboardUITests: XCTestCase {
         expectation(for: NSPredicate(format: "label == %@", "Copied to device clipboard"), evaluatedWith: copiedFeedback)
         waitForExpectations(timeout: 5)
         XCTAssertEqual(UIPasteboard.general.changeCount, baseline + 1)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            let share = app.buttons.matching(
+                NSPredicate(format: "identifier BEGINSWITH %@", "shareFiles-"),
+            ).firstMatch
+            XCTAssertTrue(share.waitForExistence(timeout: 10))
+            share.tap()
+            let remoteShare = app.otherElements["ShareSheet.RemoteContainerView"]
+            XCTAssertTrue(remoteShare.waitForExistence(timeout: 5))
+            Thread.sleep(forTimeInterval: 5)
+            let activityContent = app.otherElements["shareSheet.activity.contentView"]
+            XCTAssertTrue(activityContent.waitForExistence(timeout: 5))
+            XCTAssertGreaterThan(activityContent.frame.width, 300)
+            XCTAssertGreaterThan(activityContent.frame.height, app.frame.height * 0.5)
+            let shareScreenshot = XCTAttachment(screenshot: app.screenshot())
+            shareScreenshot.name = "iPad share sheet geometry"
+            shareScreenshot.lifetime = .keepAlways
+            add(shareScreenshot)
+            print("SHARE_SHEET_HIERARCHY\\n" + app.debugDescription)
+            let closeShareSheet = app.buttons["Close"]
+            XCTAssertTrue(closeShareSheet.waitForExistence(timeout: 5))
+            closeShareSheet.tap()
+            XCTAssertTrue(share.waitForExistence(timeout: 5))
+            share.tap()
+            XCTAssertTrue(app.otherElements["shareSheet.activity.contentView"].waitForExistence(timeout: 10))
+            XCTAssertTrue(app.staticTexts["Save Image"].waitForExistence(timeout: 5))
+            XCTAssertTrue(app.buttons["Close"].waitForExistence(timeout: 5))
+            app.buttons["Close"].tap()
+        }
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "File preview and chronological clippings"
         screenshot.lifetime = .keepAlways
