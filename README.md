@@ -1,5 +1,9 @@
 # ClipMesh
 
+<p align="center">
+  <img src="docs/images/clipmesh-hero.png" alt="ClipMesh on iPhone showing shared text and image history" width="360">
+</p>
+
 Copy on one device, paste on another. ClipMesh shares text, images, and files
 between your Linux, Mac, iPhone, and iPad devices over your private Tailscale network.
 
