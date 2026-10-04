@@ -71,6 +71,7 @@ fn run_desktop<D: Desktop>(
     }
     let mut transport = None;
     let mut backoff = ReconnectBackoff::default();
+    let mut failed_connects = 0_u32;
     let mut last_revision: Option<PlatformRevision> = None;
     let mut shared_clear_pending = false;
     let mut last_file_revision = None;
@@ -193,13 +194,21 @@ fn run_desktop<D: Desktop>(
             });
             match connection {
                 Ok(connection) => {
+                    eprintln!("hub_connected: failed_attempts={failed_connects}");
+                    failed_connects = 0;
                     // Files copied before startup, unlock, or reconnection
                     // are a baseline, not fresh publish intent.
                     last_file_revision = desktop.file_revision()?;
                     backoff.entered_live(now_ms);
                     transport = Some(connection);
                 }
-                Err(_) => {
+                Err(error) => {
+                    // Log the first failure of an outage; the eventual
+                    // hub_connected line reports how many followed.
+                    if failed_connects == 0 {
+                        eprintln!("hub_connect_failed: {error}, retrying");
+                    }
+                    failed_connects = failed_connects.saturating_add(1);
                     core.disconnect();
                     backoff.disconnected(now_ms);
                     thread::sleep(Duration::from_millis(
@@ -211,7 +220,8 @@ fn run_desktop<D: Desktop>(
         }
         if shared_clear_pending {
             if let Some(connection) = transport.as_mut() {
-                if send_shared_clear(&core, connection).is_err() {
+                if let Err(error) = send_shared_clear(&core, connection) {
+                    eprintln!("hub_connection_lost: {error}");
                     core.disconnect();
                     backoff.disconnected(now_ms);
                     transport = None;
@@ -288,9 +298,10 @@ fn run_desktop<D: Desktop>(
             if let Some(observation) = desktop.observation()? {
                 if last_revision.as_ref() != Some(&observation.revision) {
                     last_revision = Some(observation.revision.clone());
-                    if send_observation(&mut core, &mut desktop, observation, connection, now_ms)
-                        .is_err()
+                    if let Err(error) =
+                        send_observation(&mut core, &mut desktop, observation, connection, now_ms)
                     {
+                        eprintln!("hub_connection_lost: {error}");
                         core.disconnect();
                         backoff.disconnected(now_ms);
                         transport = None;
@@ -301,7 +312,8 @@ fn run_desktop<D: Desktop>(
                     }
                 }
             }
-            if drive_server_once(&mut core, &mut desktop, connection, now_ms).is_err() {
+            if let Err(error) = drive_server_once(&mut core, &mut desktop, connection, now_ms) {
+                eprintln!("hub_connection_lost: {error}");
                 core.disconnect();
                 backoff.disconnected(now_ms);
                 transport = None;
