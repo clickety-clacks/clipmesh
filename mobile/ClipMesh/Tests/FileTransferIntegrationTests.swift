@@ -5,6 +5,31 @@ import UniformTypeIdentifiers
 
 final class FileTransferIntegrationTests: XCTestCase {
     @MainActor
+    func testClipStreamPingIsAnsweredByRealHub() async throws {
+        guard let value = ProcessInfo.processInfo.environment["CLIPMESH_TEST_HUB_URL"],
+              !value.isEmpty, !value.contains("$(") else {
+            throw XCTSkip("Requires an isolated ClipMesh test hub")
+        }
+        let transport = URLSessionClipTransport()
+        try await transport.open(HubEndpoint(value))
+        defer { transport.close() }
+        let codec = ProtocolV1Codec()
+        guard case .serverHello = try codec.decodeHubMessage(await transport.receive()) else {
+            return XCTFail("expected server_hello")
+        }
+        try await transport.send(codec.encodeClientMessage(.resume(ResumeRequestV1(
+            knownHistoryEpoch: nil, knownClearGeneration: nil, afterCursor: nil,
+        ))))
+        // URLSession reports pongs only while a receive is outstanding, which
+        // the session model always has.
+        let reader = Task { while true { _ = try await transport.receive() } }
+        defer { reader.cancel() }
+        for _ in 0..<3 {
+            try await transport.ping(timeout: .seconds(5))
+        }
+    }
+
+    @MainActor
     func testBinarySelectionThroughRealHub() async throws {
         guard let value = ProcessInfo.processInfo.environment["CLIPMESH_TEST_HUB_URL"],
               !value.isEmpty, !value.contains("$(") else {

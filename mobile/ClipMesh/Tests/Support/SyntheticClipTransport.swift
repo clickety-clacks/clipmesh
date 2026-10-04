@@ -6,6 +6,9 @@ final class SyntheticClipTransport: ClipTransport {
     private(set) var openedEndpoints: [HubEndpoint] = []
     private(set) var sentMessages: [Data] = []
     private(set) var isWaitingForInput = false
+    private(set) var pingCount = 0
+    /// When false, pings fail as they would on a connection the hub dropped.
+    var answersPings = true
     private var incoming: [Data]
     private var waiter: CheckedContinuation<Data, any Error>?
 
@@ -28,6 +31,13 @@ final class SyntheticClipTransport: ClipTransport {
         return try await withCheckedThrowingContinuation { continuation in
             isWaitingForInput = true
             waiter = continuation
+        }
+    }
+
+    func ping(timeout _: Duration) async throws {
+        pingCount += 1
+        if !answersPings {
+            throw ProtocolFailure.heartbeatTimeout
         }
     }
 

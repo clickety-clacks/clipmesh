@@ -5,6 +5,7 @@ enum ProtocolFailure: String, Error, Equatable, LocalizedError {
     case clearGenerationAhead = "clear_generation_ahead"
     case clearGenerationStale = "clear_generation_stale"
     case contentTypeUnsupported = "content_type_unsupported"
+    case heartbeatTimeout = "heartbeat_timeout"
     case cursorAhead = "cursor_ahead"
     case messageTooLarge = "message_too_large"
     case payloadEmpty = "payload_empty"

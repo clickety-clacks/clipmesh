@@ -23,6 +23,54 @@ final class MobileSessionModelTests: XCTestCase {
         model.deactivate()
     }
 
+    func testUnansweredPingReconnectsAndResumesFromLastCursor() async throws {
+        let transport = SyntheticClipTransport(incoming: [
+            ProtocolFixtures.hello(generation: 1, newestCursor: 1),
+            ProtocolFixtures.resumeStarted(status: "fresh", generation: 1, boundaryCursor: 1),
+            ProtocolFixtures.event(
+                delivery: "resume",
+                cursor: 1,
+                messageSuffix: "000000000010",
+                sourcePeerID: "peer-reserved-source",
+                text: "synthetic before silence",
+            ),
+            ProtocolFixtures.resumeComplete(boundary: 1, generation: 1),
+        ])
+        let preferences = MemoryPreferences()
+        preferences.endpoint = try ProtocolFixtures.endpoint()
+        let model = MobileSessionModel(
+            transport: transport,
+            pasteboard: SyntheticPasteboardWriter(),
+            preferences: preferences,
+            now: { ProtocolFixtures.now },
+            livenessInterval: .milliseconds(20),
+            livenessTimeout: .milliseconds(20),
+        )
+        model.activate()
+        try await waitUntil("live") { model.lifecycleState == .foregroundLive }
+        try await waitUntil("answered pings keep the session") { transport.pingCount >= 3 }
+        XCTAssertEqual(transport.openedEndpoints.count, 1)
+
+        transport.answersPings = false
+        try await waitUntil("silent hub triggers reconnect") { transport.openedEndpoints.count == 2 }
+        XCTAssertEqual(model.lifecycleState, .foregroundConnecting)
+        XCTAssertNil(model.errorCode)
+
+        transport.answersPings = true
+        transport.enqueue(ProtocolFixtures.hello(generation: 1, newestCursor: 1))
+        transport.enqueue(ProtocolFixtures.resumeStarted(
+            status: "complete", generation: 1, requestedAfterCursor: 1, boundaryCursor: 1,
+        ))
+        transport.enqueue(ProtocolFixtures.resumeComplete(boundary: 1, generation: 1))
+        try await waitUntil("live again") { model.lifecycleState == .foregroundLive }
+        let resumes = transport.sentMessages
+            .map { String(decoding: $0, as: UTF8.self) }
+            .filter { $0.contains("\"type\":\"resume\"") }
+        XCTAssertEqual(resumes.count, 2)
+        XCTAssertTrue(resumes[1].contains("\"after_cursor\":\"1\""))
+        model.deactivate()
+    }
+
     func testAbandonedExplicitReadIsNotSentOnLaterLaunch() async throws {
         let transport = SyntheticClipTransport(incoming: [
             ProtocolFixtures.hello(), ProtocolFixtures.resumeStarted(),

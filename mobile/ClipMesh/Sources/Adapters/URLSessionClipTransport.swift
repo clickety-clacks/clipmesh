@@ -54,11 +54,50 @@ final class URLSessionClipTransport: ClipTransport {
         }
     }
 
+    func ping(timeout: Duration) async throws {
+        guard let task else {
+            throw ProtocolFailure.sessionContextStale
+        }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            let outcome = PingOutcome(continuation)
+            task.sendPing { error in
+                outcome.finish(error)
+            }
+            Task {
+                try? await Task.sleep(for: timeout)
+                outcome.finish(ProtocolFailure.heartbeatTimeout)
+            }
+        }
+    }
+
     func close() {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         validatedUpgrade = false
         session?.invalidateAndCancel()
         session = nil
+    }
+}
+
+/// Resumes a ping continuation exactly once, from either the pong handler
+/// or the timeout, whichever comes first.
+private final class PingOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, any Error>?
+
+    init(_ continuation: CheckedContinuation<Void, any Error>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ error: (any Error)?) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        if let error {
+            pending?.resume(throwing: error)
+        } else {
+            pending?.resume()
+        }
     }
 }

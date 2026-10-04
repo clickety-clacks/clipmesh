@@ -24,6 +24,9 @@ final class MobileSessionModel {
     @ObservationIgnored private var acknowledgementTask: Task<Void, Never>?
     @ObservationIgnored private var clearRequestTask: Task<Void, Never>?
     @ObservationIgnored private var connectionTask: Task<Void, Never>?
+    @ObservationIgnored private var livenessTask: Task<Void, Never>?
+    @ObservationIgnored private let livenessInterval: Duration
+    @ObservationIgnored private let livenessTimeout: Duration
     @ObservationIgnored private var clearGeneration: UInt64?
     @ObservationIgnored private var historyEpoch: UUID?
     @ObservationIgnored private var lastAcknowledgementAtMilliseconds: Int64?
@@ -44,7 +47,11 @@ final class MobileSessionModel {
         pasteboard: any PasteboardWriting = SystemPasteboardWriter(),
         preferences: any PreferencesStoring = ProtectedPreferences(),
         now: @escaping () -> Date = { .now },
+        livenessInterval: Duration = .seconds(15),
+        livenessTimeout: Duration = .seconds(10),
     ) {
+        self.livenessInterval = livenessInterval
+        self.livenessTimeout = livenessTimeout
         self.transport = transport
         self.pasteboard = pasteboard
         self.preferences = preferences
@@ -68,6 +75,7 @@ final class MobileSessionModel {
     }
 
     func deactivate() {
+        stopLivenessChecks()
         fileClient?.close()
         fileClient = nil
         cancelPublish()
@@ -232,6 +240,7 @@ final class MobileSessionModel {
     }
 
     private func startConnection() {
+        stopLivenessChecks()
         cancelPublish()
         connectionTask?.cancel()
         acknowledgementTask?.cancel()
@@ -488,6 +497,7 @@ final class MobileSessionModel {
         sortAndTrimHistory()
         updateVisibleHistory()
         lifecycleState = .foregroundLive
+        startLivenessChecks()
         hasStartedResume = false
         resumeBoundary = nil
         errorCode = nil
@@ -616,6 +626,7 @@ final class MobileSessionModel {
     }
 
     private func transitionToError(_ code: String) {
+        stopLivenessChecks()
         cancelPublish()
         acknowledgementTask?.cancel()
         acknowledgementTask = nil
@@ -626,6 +637,37 @@ final class MobileSessionModel {
         lifecycleState = .foregroundError
         errorCode = code
         preferences.saveConnectionState(.error)
+    }
+
+    /// A hub that silently dropped this session leaves `receive` waiting
+    /// forever, and URLSession answers hub pings without telling the app.
+    /// Pinging from here is the only way to notice; a missed answer starts a
+    /// fresh connection, which resumes from the last cursor.
+    private func startLivenessChecks() {
+        livenessTask?.cancel()
+        livenessTask = Task { [weak self, livenessInterval, livenessTimeout] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: livenessInterval)
+                guard let self, !Task.isCancelled, self.lifecycleState == .foregroundLive else {
+                    return
+                }
+                do {
+                    try await self.transport.ping(timeout: livenessTimeout)
+                } catch {
+                    guard !Task.isCancelled, self.lifecycleState == .foregroundLive else {
+                        return
+                    }
+                    self.livenessTask = nil
+                    self.startConnection()
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopLivenessChecks() {
+        livenessTask?.cancel()
+        livenessTask = nil
     }
 
     private func pruneExpiredHistory() {

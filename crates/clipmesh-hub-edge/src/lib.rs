@@ -802,6 +802,8 @@ pub struct WebSocketConnection {
 
 enum InboundFrame {
     Text(String),
+    /// A client liveness probe. Answered with a pong carrying the same bytes.
+    Ping(Vec<u8>),
     Pong,
     Close,
 }
@@ -857,6 +859,13 @@ impl WebSocketConnection {
         self.stream.flush()
     }
 
+    fn write_pong(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        // read_complete_frame admits at most 125 control payload bytes.
+        self.stream.write_all(&[0x8a, payload.len() as u8])?;
+        self.stream.write_all(payload)?;
+        self.stream.flush()
+    }
+
     fn write_close(&mut self, error: EdgeError) -> std::io::Result<()> {
         let mut payload = error.websocket_close_code().to_be_bytes().to_vec();
         payload.extend_from_slice(error.code().as_bytes());
@@ -873,7 +882,7 @@ impl WebSocketConnection {
         self.stream
             .read_exact(&mut header)
             .map_err(FrameReadFailure::from_io)?;
-        if !matches!(header[0], 0x81 | 0x8a | 0x88) || header[1] & 0x80 == 0 {
+        if !matches!(header[0], 0x81 | 0x89 | 0x8a | 0x88) || header[1] & 0x80 == 0 {
             return Err(FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid));
         }
         let length = match header[1] & 0x7f {
@@ -895,7 +904,7 @@ impl WebSocketConnection {
             }
             _ => unreachable!("WebSocket length uses seven bits"),
         };
-        if length > maximum_bytes {
+        if length > maximum_bytes || (header[0] == 0x89 && length > 125) {
             return Err(FrameReadFailure::Protocol(EdgeError::MessageTooLarge));
         }
         let mut mask = [0_u8; 4];
@@ -913,6 +922,7 @@ impl WebSocketConnection {
             0x81 => String::from_utf8(payload)
                 .map(InboundFrame::Text)
                 .map_err(|_| FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid)),
+            0x89 => Ok(InboundFrame::Ping(payload)),
             0x8a if payload.is_empty() => Ok(InboundFrame::Pong),
             0x88 => Ok(InboundFrame::Close),
             _ => Err(FrameReadFailure::Protocol(EdgeError::ProtocolSchemaInvalid)),
@@ -1936,6 +1946,12 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
                         return Err(EdgeFailure(error));
                     }
                 }
+            }
+            Ok(InboundFrame::Ping(payload)) => {
+                websocket
+                    .write_pong(&payload)
+                    .map_err(|_| EdgeFailure(EdgeError::OutputFailed))?;
+                last_outbound = Instant::now();
             }
             Ok(InboundFrame::Pong) => {
                 edge.note_pong(session, now_ms)?;
@@ -3585,6 +3601,27 @@ mod tests {
                 .read_complete_frame(edge.config().maximum_message_bytes())
                 .unwrap(),
             InboundFrame::Pong
+        ));
+        client
+            .write_all(&[0x89, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2])
+            .unwrap();
+        let InboundFrame::Ping(payload) = websocket
+            .read_complete_frame(edge.config().maximum_message_bytes())
+            .unwrap()
+        else {
+            panic!("client ping was not admitted");
+        };
+        assert_eq!(payload, b"hi");
+        websocket.write_pong(&payload).unwrap();
+        let mut pong = [0_u8; 4];
+        client.read_exact(&mut pong).unwrap();
+        assert_eq!(pong, [0x8a, 2, b'h', b'i']);
+        let mut oversized = vec![0x89, 0x80 | 126, 0, 126, 0, 0, 0, 0];
+        oversized.extend_from_slice(&[0; 126]);
+        client.write_all(&oversized).unwrap();
+        assert!(matches!(
+            websocket.read_complete_frame(edge.config().maximum_message_bytes()),
+            Err(FrameReadFailure::Protocol(EdgeError::MessageTooLarge))
         ));
         client.write_all(&[0x82, 0x80, 0, 0, 0, 0]).unwrap();
         assert_eq!(
