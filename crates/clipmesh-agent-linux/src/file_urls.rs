@@ -99,7 +99,7 @@ mod tests {
         );
         for value in [
             "/tmp/file",
-            "https://host/file",
+            "https://example.invalid/file",
             "file://remote/tmp/file",
             "file:///tmp/%",
             "file:///tmp/%00",

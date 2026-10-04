@@ -889,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // tungstenite's handshake callback signature
     fn hub_that_goes_silent_mid_session_forces_a_resuming_reconnect() {
         use std::{net::TcpListener, sync::mpsc, thread};
 

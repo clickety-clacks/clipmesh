@@ -504,7 +504,7 @@ mod tests {
         let remote = clip(2);
         let local = clip(3);
         let mut arrivals = FileArrivals::default();
-        assert!(arrivals.observe(&[old.clone()]).is_none());
+        assert!(arrivals.observe(std::slice::from_ref(&old)).is_none());
         assert_eq!(
             arrivals
                 .observe(&[remote.clone(), old.clone()])
@@ -564,7 +564,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("archive.zip");
         std::fs::write(&path, [0, 255, 128, 1]).unwrap();
-        let files = read_selection(&[path.clone()]).unwrap();
+        let files = read_selection(std::slice::from_ref(&path)).unwrap();
         assert_eq!(files[0].0.name, "archive.zip");
         assert_eq!(files[0].1, [0, 255, 128, 1]);
         assert_eq!(files[0].0.media_type, "application/zip");

@@ -102,10 +102,8 @@ impl FileRequest {
             }
             Self::Download {
                 file_index, offset, ..
-            } => {
-                if *file_index as usize >= MAX_FILES_PER_CLIP || *offset > MAX_FILE_BYTES {
-                    return Err(FileError::LimitExceeded);
-                }
+            } if *file_index as usize >= MAX_FILES_PER_CLIP || *offset > MAX_FILE_BYTES => {
+                return Err(FileError::LimitExceeded);
             }
             _ => {}
         }

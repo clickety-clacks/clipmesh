@@ -1361,7 +1361,7 @@ mod tests {
         let mut clipboard = WaylandClipboard::connect().unwrap();
         let before = clipboard.write_text(b"synthetic baseline").unwrap();
         let applied = clipboard
-            .write_files_if_current(&[path.clone()], &before)
+            .write_files_if_current(std::slice::from_ref(&path), &before)
             .unwrap()
             .unwrap();
         assert!(clipboard.observe_text().unwrap().is_none());

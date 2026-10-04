@@ -32,6 +32,7 @@ pub enum LockState {
     Unknown,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify_lock_state(screen_is_locked: Option<bool>, on_console: Option<bool>) -> LockState {
     match screen_is_locked {
         Some(true) => LockState::Locked,

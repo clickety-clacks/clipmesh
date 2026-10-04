@@ -112,7 +112,7 @@ fn validate_png_header(bytes: &[u8]) -> io::Result<()> {
         return Err(invalid_data("image dimensions exceed bounds"));
     }
     let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS || pixels.checked_mul(4).unwrap_or(u64::MAX) > MAX_MEMORY_BYTES {
+    if pixels > MAX_PIXELS || pixels.saturating_mul(4) > MAX_MEMORY_BYTES {
         return Err(invalid_data("image pixels exceed bounds"));
     }
     Ok(())

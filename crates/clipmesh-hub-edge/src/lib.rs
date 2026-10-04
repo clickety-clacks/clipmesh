@@ -1843,15 +1843,17 @@ fn serve_socket(edge: &HubEdge, stream: TcpStream) -> Result<(), EdgeFailure> {
                 return close_with(edge, session, &mut websocket, error, None);
             }
         }
-        while !files {
-            match edge.write_next_event(session, &mut websocket) {
-                Ok(true) => {
-                    last_outbound = Instant::now();
-                    ping_sent = None;
-                }
-                Ok(false) => break,
-                Err(EdgeFailure(error)) => {
-                    return close_with(edge, session, &mut websocket, error, None)
+        if !files {
+            loop {
+                match edge.write_next_event(session, &mut websocket) {
+                    Ok(true) => {
+                        last_outbound = Instant::now();
+                        ping_sent = None;
+                    }
+                    Ok(false) => break,
+                    Err(EdgeFailure(error)) => {
+                        return close_with(edge, session, &mut websocket, error, None)
+                    }
                 }
             }
         }

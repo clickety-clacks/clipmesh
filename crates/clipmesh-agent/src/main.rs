@@ -82,13 +82,16 @@ fn run_desktop<D: Desktop>(
         History(Vec<clipmesh_protocol::files::FileHistoryEntry>),
         Download(clipmesh_agent::files::ReceivedSelection),
     }
-    let mut file_job: Option<(
+    // Worker, the revision it serves, the session epoch and clear generation
+    // it started under, and its cancellation flag.
+    type FileJob = (
         thread::JoinHandle<Result<FileResult, AgentError>>,
         PlatformRevision,
         Option<uuid::Uuid>,
         Option<u64>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
-    )> = None;
+    );
+    let mut file_job: Option<FileJob> = None;
     let mut next_file_poll = std::time::Instant::now();
     let mut file_upload: Option<(
         thread::JoinHandle<()>,
@@ -721,20 +724,19 @@ mod file_loop_tests {
                     && paths[0].starts_with(&self.received_root)
                     && paths[0].file_name().and_then(|name| name.to_str())
                         == Some(self.received_name.as_str())
+                    && !self.delivered.swap(true, Ordering::AcqRel)
                 {
-                    if !self.delivered.swap(true, Ordering::AcqRel) {
-                        assert_eq!(std::fs::read(&paths[0]).unwrap(), ONE_BY_ONE_PNG);
-                        assert!(self.clipboard.observe_text().unwrap().is_none());
-                        let mimes = MacPasteboard::capture_mime_types().unwrap();
-                        assert!(mimes.iter().any(|mime| mime == "image/png"));
-                        assert!(mimes.iter().any(|mime| mime == "text/uri-list"));
-                        assert!(mimes.iter().any(|mime| {
-                            mime.starts_with("application/x-clipmesh-write-marker-")
-                        }));
-                        // Leave the loop alive for two file-poll intervals so
-                        // a remote selection cannot immediately echo back.
-                        self.stop_at = Some(std::time::Instant::now() + Duration::from_secs(7));
-                    }
+                    assert_eq!(std::fs::read(&paths[0]).unwrap(), ONE_BY_ONE_PNG);
+                    assert!(self.clipboard.observe_text().unwrap().is_none());
+                    let mimes = MacPasteboard::capture_mime_types().unwrap();
+                    assert!(mimes.iter().any(|mime| mime == "image/png"));
+                    assert!(mimes.iter().any(|mime| mime == "text/uri-list"));
+                    assert!(mimes
+                        .iter()
+                        .any(|mime| { mime.starts_with("application/x-clipmesh-write-marker-") }));
+                    // Leave the loop alive for two file-poll intervals so
+                    // a remote selection cannot immediately echo back.
+                    self.stop_at = Some(std::time::Instant::now() + Duration::from_secs(7));
                 }
             }
             if self

@@ -40,5 +40,5 @@ The app accepts only numeric Tailnet endpoints. App Transport Security
 exceptions cover `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, matching that
 validation. There is no global arbitrary-load exception. The hub protocol uses
 WebSockets inside the encrypted Tailscale network, without separate application
-TLS. Apple documents IP-range exceptions in
-[NSExceptionDomains](https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSAppTransportSecurity/NSExceptionDomains).
+TLS. Apple documents IP-range exceptions under the `NSExceptionDomains` key of
+`NSAppTransportSecurity`.
