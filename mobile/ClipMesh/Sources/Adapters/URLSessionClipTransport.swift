@@ -81,7 +81,7 @@ final class URLSessionClipTransport: ClipTransport {
 
 /// Resumes a ping continuation exactly once, from either the pong handler
 /// or the timeout, whichever comes first.
-private final class PingOutcome: @unchecked Sendable {
+private nonisolated final class PingOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, any Error>?
 
