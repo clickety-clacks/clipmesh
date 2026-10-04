@@ -801,7 +801,7 @@ mod tests {
         let path = directory.path().join("a file #1.bin");
         std::fs::write(&path, [0, 255, 128]).unwrap();
         let pasteboard = super::MacPasteboard::unique_for_capture().unwrap();
-        let revision = pasteboard.write_files(&[path.clone()]).unwrap();
+        let revision = pasteboard.write_files(std::slice::from_ref(&path)).unwrap();
         let (paths, observed) = pasteboard.observe_files().unwrap().unwrap();
         assert_eq!(paths, vec![path]);
         assert_eq!(observed, revision);
@@ -819,9 +819,11 @@ mod tests {
         }
         let pasteboard = super::MacPasteboard::unique_for_capture().unwrap();
         let captured = pasteboard.write_files(&[original]).unwrap();
-        let current = pasteboard.write_files(&[newer.clone()]).unwrap();
+        let current = pasteboard
+            .write_files(std::slice::from_ref(&newer))
+            .unwrap();
         assert!(pasteboard
-            .write_files_if_current(&[incoming.clone()], &captured)
+            .write_files_if_current(std::slice::from_ref(&incoming), &captured)
             .unwrap()
             .is_none());
         assert_eq!(
@@ -829,7 +831,7 @@ mod tests {
             (vec![newer], current.clone())
         );
         let applied = pasteboard
-            .write_files_if_current(&[incoming.clone()], &current)
+            .write_files_if_current(std::slice::from_ref(&incoming), &current)
             .unwrap()
             .unwrap();
         assert_eq!(
