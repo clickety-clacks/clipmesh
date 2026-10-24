@@ -1,0 +1,9 @@
+{
+  "id" : "61ae3b41-c81f-4a2b-8138-45f9e0de0ec9",
+  "targets" : [
+    {
+      "id" : "c608d495-7be9-47dd-9f94-4f6ab562bb5f",
+      "name" : "ClipMesh"
+    }
+  ]
+}
