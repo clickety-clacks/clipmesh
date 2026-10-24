@@ -15,7 +15,6 @@
 		0AF9C963C097EDB555DFD65F /* ClearHistoryRequestV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = A71CA1731503112822DA488D /* ClearHistoryRequestV1.swift */; };
 		0DB785D91823F3CA0059AB52 /* ResumeStartedV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 004371ECA85A8A7D91AC0750 /* ResumeStartedV1.swift */; };
 		0F60255A2C65046A70713BB2 /* HubEndpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03F50B534B2725FFD0126AA0 /* HubEndpointTests.swift */; };
-		11A0E9D4A39F4C8E91B5F102 /* ClipMeshShareSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 11B0E9D4A39F4C8E91B5F102 /* ClipMeshShareSheet.swift */; };
 		1226D91BD201A7A9A1574BFF /* ProtectedPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE1C7E6594DABA1F77C1DFB2 /* ProtectedPreferences.swift */; };
 		1B33D6336B02BF59193C055D /* MobileSessionModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1F21212B34671773EF27FD62 /* MobileSessionModel.swift */; };
 		1F16CBCDEB2A107B97FD8F2F /* SystemPasteboardWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8581A85D7A71869A616F4B3B /* SystemPasteboardWriter.swift */; };
@@ -25,6 +24,7 @@
 		2F986BF4F6C6DBB2B133653B /* RealPasteboardTransitionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05F85E507A05EB4F6BA26F36 /* RealPasteboardTransitionTests.swift */; };
 		2FC625E18694860D3C7F46D7 /* ConnectionSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B6821895FD19D2C82FD4994 /* ConnectionSettingsView.swift */; };
 		32AB020BA3D810EEAA9180FF /* HubMessageV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76E37AA53FEE0E56EE485B55 /* HubMessageV1.swift */; };
+		379F59E41478BC3A98B70FFD /* ClipMeshShareSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD0B34FFA883051C2ED920A0 /* ClipMeshShareSheet.swift */; };
 		3B0FE883760E665AED61A306 /* HistoryRowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B5A5FB9BD355A4250BEB749 /* HistoryRowView.swift */; };
 		40A35B2EB2B17C79C9FAEC3E /* ClipboardFileImportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5703406239A2F64F5C032E1B /* ClipboardFileImportTests.swift */; };
 		421E1AE80BD43ADE263CF2ED /* ErrorV1.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A62CE552A3A41411BF7BA22 /* ErrorV1.swift */; };
@@ -104,7 +104,6 @@
 		0B5A5FB9BD355A4250BEB749 /* HistoryRowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryRowView.swift; sourceTree = "<group>"; };
 		0BEF8369C6F01B68CB2D7E7A /* ProtocolFailure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtocolFailure.swift; sourceTree = "<group>"; };
 		0F6BA34B5F37D15FE4FD1AAA /* FileHistoryModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileHistoryModel.swift; sourceTree = "<group>"; };
-		11B0E9D4A39F4C8E91B5F102 /* ClipMeshShareSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipMeshShareSheet.swift; sourceTree = "<group>"; };
 		160A8E7CEB051F24E8AC79D3 /* HistoryRowPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryRowPresentation.swift; sourceTree = "<group>"; };
 		178FB34101501B151C684126 /* ClipMesh.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = ClipMesh.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		182A7EBF82456BFC5D6490AC /* ClearAcceptedV1.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClearAcceptedV1.swift; sourceTree = "<group>"; };
@@ -164,6 +163,7 @@
 		E95ACBC9A1ABCC3CF6E87E13 /* ConnectionStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStatusView.swift; sourceTree = "<group>"; };
 		EF633EE618413877F98736C9 /* SourceMetadataTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceMetadataTests.swift; sourceTree = "<group>"; };
 		F644CFEBA30FFF287E0504BE /* URLSessionClipTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = URLSessionClipTransport.swift; sourceTree = "<group>"; };
+		FD0B34FFA883051C2ED920A0 /* ClipMeshShareSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipMeshShareSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -313,7 +313,7 @@
 		BCFC5F2A9EE25FED3BD25545 /* Adapters */ = {
 			isa = PBXGroup;
 			children = (
-				11B0E9D4A39F4C8E91B5F102 /* ClipMeshShareSheet.swift */,
+				FD0B34FFA883051C2ED920A0 /* ClipMeshShareSheet.swift */,
 				702B5EB43D3A28F80F35A629 /* ClipTransport.swift */,
 				4E354222C081E9E568EFF759 /* FileTransferClient.swift */,
 				78FAAB31F35CA6236C8197BA /* PasteboardWriting.swift */,
@@ -416,8 +416,18 @@
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
+					0675E159DD3F6131035E9668 = {
+						DevelopmentTeam = Z7R59J7QV8;
+						ProvisioningStyle = Automatic;
+					};
 					9A42FFC8830363BD5844CB98 = {
+						DevelopmentTeam = Z7R59J7QV8;
+						ProvisioningStyle = Automatic;
 						TestTargetID = FA6CF22DCD0B19C6DC2B214E;
+					};
+					FA6CF22DCD0B19C6DC2B214E = {
+						DevelopmentTeam = Z7R59J7QV8;
+						ProvisioningStyle = Automatic;
 					};
 				};
 			};
@@ -504,6 +514,7 @@
 				777AAEAFC8EB2540359BBBE0 /* ClientMessageV1.swift in Sources */,
 				7861013F0FD26E2250190248 /* ClipContentV1.swift in Sources */,
 				044ECAD673D0D2DC6D5DF902 /* ClipMeshApp.swift in Sources */,
+				379F59E41478BC3A98B70FFD /* ClipMeshShareSheet.swift in Sources */,
 				F23C1A7880F56B22A3A5FD6F /* ClipTransport.swift in Sources */,
 				2FC625E18694860D3C7F46D7 /* ConnectionSettingsView.swift in Sources */,
 				860F75A167A20C515DE31117 /* ConnectionState.swift in Sources */,
@@ -514,7 +525,6 @@
 				E9B0848EB6EE72094C86CEA6 /* EventV1.swift in Sources */,
 				DC695EAB7BE87DAFBBC67F3D /* FileClipRow.swift in Sources */,
 				2A52700796C1EE2FB890BF78 /* FileHistoryModel.swift in Sources */,
-				11A0E9D4A39F4C8E91B5F102 /* ClipMeshShareSheet.swift in Sources */,
 				5819D5130CBF5863DEC79873 /* FileTransferClient.swift in Sources */,
 				01442C2725E14A0B2253A678 /* HistoryListView.swift in Sources */,
 				A521D20933C76E838C3A5489 /* HistoryRowPresentation.swift in Sources */,
@@ -574,7 +584,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshUITests;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMeshUITests;
 				SDKROOT = iphoneos;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -586,15 +596,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = Sources/App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMesh;
+				MARKETING_VERSION = 0.1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMesh;
 				PRODUCT_NAME = ClipMesh;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -605,15 +615,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = Sources/App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMesh;
+				MARKETING_VERSION = 0.1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMesh;
 				PRODUCT_NAME = ClipMesh;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -624,14 +634,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_IDENTITY = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshTests;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMeshTests;
 				SDKROOT = iphoneos;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -672,11 +681,10 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
-				CODE_SIGNING_ALLOWED = NO;
-				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = Z7R59J7QV8;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -704,14 +712,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGN_IDENTITY = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshTests;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMeshTests;
 				SDKROOT = iphoneos;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -752,11 +759,10 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
-				CODE_SIGNING_ALLOWED = NO;
-				CODE_SIGNING_REQUIRED = NO;
-				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = Z7R59J7QV8;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -797,7 +803,7 @@
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.example.ClipMeshUITests;
+				PRODUCT_BUNDLE_IDENTIFIER = co.clicketyclacks.ClipMeshUITests;
 				SDKROOT = iphoneos;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated;
 				TARGETED_DEVICE_FAMILY = "1,2";
