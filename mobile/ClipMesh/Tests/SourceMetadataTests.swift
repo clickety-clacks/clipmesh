@@ -6,41 +6,41 @@ final class SourceMetadataTests: XCTestCase {
     private let clipID = "00000000-0000-4000-8000-00000000000a"
 
     private func metadata(
-        peers: [[String: Any]] = [["id": "peer-gibson", "display_name": "gibson"]],
+        peers: [[String: Any]] = [["id": "peer-example-host", "display_name": "example-host"]],
         fileSources: [[String: Any]]? = nil,
     ) -> [String: Any] {
         [
             "protocol_version": 1,
             "type": "source_metadata",
             "peers": peers,
-            "file_sources": fileSources ?? [["clip_id": clipID, "source_peer_id": "peer-gibson"]],
+            "file_sources": fileSources ?? [["clip_id": clipID, "source_peer_id": "peer-example-host"]],
         ]
     }
 
     func testDecodesPeerNamesAndFileSources() throws {
         let result = try FileTransferClient.decodeSourceMetadata(metadata())
 
-        XCTAssertEqual(result.namesByPeerID, ["peer-gibson": "gibson"])
-        XCTAssertEqual(result.fileSourcePeerIDs[UUID(uuidString: clipID)!], "peer-gibson")
+        XCTAssertEqual(result.namesByPeerID, ["peer-example-host": "example-host"])
+        XCTAssertEqual(result.fileSourcePeerIDs[UUID(uuidString: clipID)!], "peer-example-host")
     }
 
     func testRejectsDuplicatePeerIDsAndFileClipIDs() {
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(peers: [
-            ["id": "peer-gibson", "display_name": "gibson"],
-            ["id": "peer-gibson", "display_name": "other"],
+            ["id": "peer-example-host", "display_name": "example-host"],
+            ["id": "peer-example-host", "display_name": "other"],
         ])))
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(fileSources: [
-            ["clip_id": clipID, "source_peer_id": "peer-gibson"],
+            ["clip_id": clipID, "source_peer_id": "peer-example-host"],
             ["clip_id": clipID, "source_peer_id": "peer-other"],
         ])))
     }
 
     func testRejectsUnknownFieldsMalformedValuesAndNonCanonicalUUIDs() {
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(peers: [
-            ["id": "peer-gibson", "display_name": "gibson", "extra": true],
+            ["id": "peer-example-host", "display_name": "example-host", "extra": true],
         ])))
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(fileSources: [
-            ["clip_id": clipID.uppercased(), "source_peer_id": "peer-gibson"],
+            ["clip_id": clipID.uppercased(), "source_peer_id": "peer-example-host"],
         ])))
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(fileSources: [
             ["clip_id": clipID, "source_peer_id": "peer\nname"],
@@ -56,7 +56,7 @@ final class SourceMetadataTests: XCTestCase {
         let files = (0 ..< 501).map { index in
             [
                 "clip_id": String(format: "00000000-0000-4000-8000-%012d", index),
-                "source_peer_id": "peer-gibson",
+                "source_peer_id": "peer-example-host",
             ] as [String: Any]
         }
         XCTAssertThrowsError(try FileTransferClient.decodeSourceMetadata(metadata(fileSources: files)))
@@ -67,7 +67,7 @@ final class SourceMetadataTests: XCTestCase {
         let model = FileHistoryModel { _ in
             calls += 1
             try await Task.sleep(for: .milliseconds(100))
-            return MeshMachineDirectory(namesByPeerID: ["peer": "gibson"], fileSourcePeerIDs: [:])
+            return MeshMachineDirectory(namesByPeerID: ["peer": "example-host"], fileSourcePeerIDs: [:])
         }
         let endpoint = "ws://100.64.0.7:18494/v1/stream"
         let first = Task { await model.refreshSourceMetadata(endpoint: endpoint, textPeerIDs: ["peer"]) }
@@ -77,7 +77,7 @@ final class SourceMetadataTests: XCTestCase {
         await second.value
 
         XCTAssertEqual(calls, 1)
-        XCTAssertEqual(model.machineNames, ["peer": "gibson"])
+        XCTAssertEqual(model.machineNames, ["peer": "example-host"])
         model.stop()
     }
 
@@ -123,7 +123,7 @@ final class SourceMetadataTests: XCTestCase {
         var calls = 0
         let model = FileHistoryModel { _ in
             calls += 1
-            return MeshMachineDirectory(namesByPeerID: ["peer": "gibson"], fileSourcePeerIDs: [:])
+            return MeshMachineDirectory(namesByPeerID: ["peer": "example-host"], fileSourcePeerIDs: [:])
         }
         let endpoint = "ws://100.64.0.7:18494/v1/stream"
 
@@ -139,7 +139,7 @@ final class SourceMetadataTests: XCTestCase {
         let model = FileHistoryModel(
             sourceMetadataLoader: { _ in
                 calls += 1
-                return MeshMachineDirectory(namesByPeerID: ["peer": "gibson"], fileSourcePeerIDs: [:])
+                return MeshMachineDirectory(namesByPeerID: ["peer": "example-host"], fileSourcePeerIDs: [:])
             },
             sourceMetadataFreshnessInterval: 1,
             sourceMetadataMinimumInterval: 0.05,

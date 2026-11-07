@@ -14,7 +14,7 @@ applies the normal per-peer HTTP request bucket, and then returns:
   "protocol_version": 1,
   "type": "source_metadata",
   "peers": [
-    {"id": "<stable-id>", "display_name": "gibson"}
+    {"id": "<stable-id>", "display_name": "example-host"}
   ],
   "file_sources": [
     {"clip_id": "<uuid>", "source_peer_id": "<stable-id>"}

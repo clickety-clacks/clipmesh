@@ -13,12 +13,13 @@ public fixture. A seeded unrecognized MIME value must fail sanitization. The
 same capture observed an unassociated real logind query as unknown and the
 adapter acted locked.
 
-`r4-logind-transition-v1.json` came from `capture_logind_transition` on Gibson.
-The capture ran the host's real `systemd-logind` binary inside a private user
-and PID namespace with a private D-Bus socket and runtime directory. A minimal
-private systemd-manager seam supplied only disposable scope lifecycle. The
-capture bound the real `wlr-data-control-v1` interface, then the production
-logind adapter read one real private session as it changed from unlocked to
+`r4-logind-transition-v1.json` came from `capture_logind_transition` on a
+development host. The capture ran the host's real `systemd-logind` binary
+inside a private user and PID namespace with a private D-Bus socket and
+runtime directory. A minimal private systemd-manager seam supplied only
+disposable scope lifecycle. The capture bound the real
+`wlr-data-control-v1` interface, then the production logind adapter read
+one real private session as it changed from unlocked to
 locked to unlocked. The private namespace was destroyed after the capture; the
 host system bus and existing sessions were never opened or changed.
 
