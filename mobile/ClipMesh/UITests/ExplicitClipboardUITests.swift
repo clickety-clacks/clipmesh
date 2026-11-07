@@ -249,7 +249,7 @@ final class ExplicitClipboardUITests: XCTestCase {
         search.typeText(marker)
         XCTAssertTrue(app.buttons["latestClip"].waitForExistence(timeout: 10))
         search.buttons["Clear text"].tap()
-        let sourceName = ProcessInfo.processInfo.environment["CLIPMESH_TEST_SOURCE_NAME"] ?? "eezo"
+        let sourceName = ProcessInfo.processInfo.environment["CLIPMESH_TEST_SOURCE_NAME"] ?? "example-host"
         search.typeText(sourceName)
         XCTAssertTrue(app.staticTexts["From \(sourceName)"].waitForExistence(timeout: 10))
         app.terminate()

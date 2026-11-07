@@ -11,23 +11,23 @@ final class HistoryPresentationTests: XCTestCase {
             preview: "short preview",
             searchableContent: "short preview with the complete searchable sentence",
             sourcePeerID: "peer-source",
-            sourceMachineName: "gibson",
+            sourceMachineName: "example-host",
             isStale: false,
         )
 
         XCTAssertTrue(row.matches("complete searchable sentence"))
-        XCTAssertTrue(row.matches("gibson"))
+        XCTAssertTrue(row.matches("example-host"))
     }
 
     func testSourceMetadataMapsPeerNamesAndFileSources() throws {
         let clipID = "00000000-0000-4000-8000-000000000001"
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data("""
-        {"protocol_version":1,"type":"source_metadata","peers":[{"id":"peer-gibson","display_name":"gibson"}],"file_sources":[{"clip_id":"\(clipID)","source_peer_id":"peer-gibson"}]}
+        {"protocol_version":1,"type":"source_metadata","peers":[{"id":"peer-example-host","display_name":"example-host"}],"file_sources":[{"clip_id":"\(clipID)","source_peer_id":"peer-example-host"}]}
         """.utf8)) as? [String: Any])
 
         let metadata = try FileTransferClient.decodeSourceMetadata(object)
-        XCTAssertEqual(metadata.namesByPeerID["peer-gibson"], "gibson")
-        XCTAssertEqual(metadata.fileSourcePeerIDs[UUID(uuidString: clipID)!], "peer-gibson")
+        XCTAssertEqual(metadata.namesByPeerID["peer-example-host"], "example-host")
+        XCTAssertEqual(metadata.fileSourcePeerIDs[UUID(uuidString: clipID)!], "peer-example-host")
     }
 
     func testFileHistorySchemaRemainsCompatibleWithOldReplies() throws {

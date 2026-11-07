@@ -2485,7 +2485,7 @@ mod tests {
                                         json!([state.address.to_string()]);
                                     contract["status"]["Self"] = json!({
                                         "ID": "self-reserved-example",
-                                        "DNSName": "gibson.tail.example."
+                                        "DNSName": "laptop.tail.example."
                                     });
                                     contract["status"]["Peer"] = json!({
                                         "nodekey:peer-reserved-example": {
@@ -2897,7 +2897,7 @@ mod tests {
                 },
                 PeerDirectoryEntry {
                     id: "self-reserved-example".to_owned(),
-                    display_name: "gibson".to_owned(),
+                    display_name: "laptop".to_owned(),
                 },
             ]
         );
