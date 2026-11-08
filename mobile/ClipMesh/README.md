@@ -14,6 +14,36 @@ Choose files from the attachment menu to send images and other files. File
 history offers previews, download, copy, and share actions. History rows keep
 their source machine name and can be searched by text, filename, or machine.
 
+## ClipMesh keyboard
+
+The app includes a keyboard with **Cut**, **Copy** and **Paste** keys, a globe
+key when iOS asks for one, and a status line for the last tap. Copy writes the
+selected text to the device clipboard and sends it to ClipMesh in one tap.
+Paste inserts the newest ClipMesh clip and leaves the device clipboard alone.
+The keyboard has no letter keys; switch back with the globe key.
+
+iOS gives a keyboard only the selection the text field reports, which for a
+long selection is often just its first sentence or two, with line breaks
+turned into spaces. Some fields, such as web text areas, report nothing. So
+Copy always says how many characters it copied and that this may be only part
+of the selection. iOS gives a keyboard no way to confirm it has the whole
+selection, so Cut never removes text: it says it could not confirm the whole
+selection and changes nothing.
+
+To set it up:
+
+1. Open the ClipMesh app once and save the hub URL. The keyboard reads only
+   that URL, through the app's App Group.
+2. Open **Settings > General > Keyboard > Keyboards > Add New Keyboard** and
+   choose **ClipMesh**.
+3. Tap **ClipMesh** in that list and turn on **Allow Full Access**. Without it
+   the keyboard can neither reach the hub nor use the clipboard, and every key
+   only says how to turn it on.
+
+The keyboard connects to the hub only for the length of a tap. While the app is
+open and holding its two connections, the hub's per-device limit refuses the
+keyboard and its status reads busy.
+
 ## Build and test
 
 Open `ClipMesh.xcodeproj` in Xcode, or run:
@@ -30,6 +60,16 @@ setting. Set it to a numeric Tailnet WebSocket URL ending in `/v1/stream` on a
 dedicated test hub. The test publishes synthetic text, exercises actual button
 taps and paste permission, relaunches the app with a different local clipboard,
 and verifies explicit copying back. It changes the simulator clipboard.
+
+The same setting runs `KeyboardHubIntegrationTests` against the hub. They
+publish, clear the shared history and hold two connections at once, so the hub
+must be one nobody uses. Add `TEST_RUNNER_CLIPMESH_TEST_HUB_FILL=1` to also
+fill its whole history with clips at the maximum payload size and check that
+Paste receives only the newest one.
+
+`KeyboardSelectionUITests` also needs `TEST_RUNNER_CLIPMESH_TEST_KEYBOARD=1`. It
+adds the keyboard and allows Full Access in the simulator's Settings, then runs
+Cut, Copy and Paste on long selections in Contacts and Safari.
 
 `project.yml` is the XcodeGen source. After changing targets or source files,
 run `xcodegen generate` here and retain the generated Xcode project.

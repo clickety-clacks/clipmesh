@@ -45,7 +45,7 @@ final class MobileSessionModel {
     init(
         transport: any ClipTransport = URLSessionClipTransport(),
         pasteboard: any PasteboardWriting = SystemPasteboardWriter(),
-        preferences: any PreferencesStoring = ProtectedPreferences(),
+        preferences: any PreferencesStoring = ProtectedPreferences(sharedHubURL: SharedHubURLStore()),
         now: @escaping () -> Date = { .now },
         livenessInterval: Duration = .seconds(15),
         livenessTimeout: Duration = .seconds(10),
