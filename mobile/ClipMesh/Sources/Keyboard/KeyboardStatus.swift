@@ -2,16 +2,14 @@ import Foundation
 
 /// The keyboard's status line: one outcome for the last tap.
 enum KeyboardStatus: Equatable {
-    enum CopyKind: Equatable {
-        case copy
-        case cut
-    }
-
     case idle
     case noSelection
     case fullAccessNeeded
-    case iPhoneWriteFailed(CopyKind)
-    case copy(CopyKind, KeyboardCopyOutcome)
+    case cutRefused
+    case iPhoneWriteFailed
+    /// A Copy that wrote the iPhone clipboard, with the reported text's
+    /// length in characters as the user sees them.
+    case copy(characters: Int, KeyboardCopyOutcome)
     case pasteFetching
     case paste(KeyboardPasteOutcome)
 
@@ -20,13 +18,20 @@ enum KeyboardStatus: Equatable {
         case .idle:
             ""
         case .noSelection:
-            "No text selected"
+            // The keyboard cannot tell an empty selection from one the host
+            // field did not share.
+            "No selected text shared with the keyboard"
         case .fullAccessNeeded:
             "Allow Full Access to use ClipMesh: Settings > General > Keyboard > Keyboards > ClipMesh"
-        case let .iPhoneWriteFailed(kind):
-            kind == .cut ? "Couldn't cut to iPhone" : "Couldn't copy to iPhone"
-        case let .copy(kind, outcome):
-            "\(kind == .cut ? "Cut" : "Copied") to iPhone\(outcome.suffix)"
+        case .cutRefused:
+            "Didn't cut: couldn't confirm the whole selection. Copy still works."
+        case .iPhoneWriteFailed:
+            "Couldn't copy to iPhone"
+        case let .copy(characters, outcome):
+            // iOS can report only part of a selection, with its spacing
+            // changed, and gives no sign of it, so every copy says so.
+            "Copied \(characters) \(characters == 1 ? "character" : "characters") to iPhone\(outcome.suffix)"
+                + " This may be only part of your selection, or differ in spacing."
         case .pasteFetching:
             "Getting the newest ClipMesh clip…"
         case let .paste(outcome):
@@ -35,7 +40,7 @@ enum KeyboardStatus: Equatable {
     }
 }
 
-/// The ClipMesh half of a Copy or Cut whose iPhone write succeeded.
+/// The ClipMesh half of a Copy whose iPhone write succeeded.
 enum KeyboardCopyOutcome: Equatable {
     case sending
     case confirmed
@@ -59,7 +64,7 @@ enum KeyboardCopyOutcome: Equatable {
     var suffix: String {
         switch self {
         case .sending: ". Sending to ClipMesh…"
-        case .confirmed: " and ClipMesh"
+        case .confirmed: " and ClipMesh."
         case .unconfirmed: ". ClipMesh didn't confirm."
         case .unreachable: ". Couldn't reach ClipMesh."
         case let .refused(code): ". ClipMesh refused it (\(Self.describe(code)))."

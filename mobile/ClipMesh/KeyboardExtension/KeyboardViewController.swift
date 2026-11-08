@@ -17,7 +17,7 @@ final class KeyboardViewController: UIInputViewController {
             onStatus: { [weak self] status in self?.show(status) },
         )
 
-        let cut = keyButton("Cut", symbol: "scissors", identifier: "keyboard.cut") { await $0.cut() }
+        let cut = keyButton("Cut", symbol: "scissors", identifier: "keyboard.cut") { $0.cut() }
         let copy = keyButton("Copy", symbol: "doc.on.doc", identifier: "keyboard.copy") { await $0.copy() }
         let paste = keyButton("Paste", symbol: "doc.on.clipboard", identifier: "keyboard.paste") { await $0.paste() }
 
@@ -37,7 +37,7 @@ final class KeyboardViewController: UIInputViewController {
         statusLabel.adjustsFontForContentSizeCategory = true
         statusLabel.textColor = .secondaryLabel
         statusLabel.textAlignment = .center
-        statusLabel.numberOfLines = 2
+        statusLabel.numberOfLines = 3
         statusLabel.accessibilityIdentifier = "keyboard.status"
 
         let stack = UIStackView(arrangedSubviews: [statusLabel, keys])
@@ -90,7 +90,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 }
 
-/// Reads and edits the host field through the keyboard's text document proxy.
+/// Reads the selection and inserts pasted text through the keyboard's text document proxy.
 private final class ProxyTextTarget: KeyboardTextTarget {
     private weak var controller: UIInputViewController?
 
@@ -100,10 +100,6 @@ private final class ProxyTextTarget: KeyboardTextTarget {
 
     var selectedText: String? {
         controller?.textDocumentProxy.selectedText
-    }
-
-    func deleteBackward() {
-        controller?.textDocumentProxy.deleteBackward()
     }
 
     func insertText(_ text: String) {

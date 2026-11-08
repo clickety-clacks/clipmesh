@@ -3,47 +3,62 @@ import XCTest
 
 @MainActor
 final class KeyboardActionsTests: XCTestCase {
-    func testCutWritesTheClipboardThenRemovesTheSelectionWithoutWaitingForClipMesh() async throws {
-        let harness = try Harness(selection: "hello mesh")
-        let cut = Task { await harness.actions.cut() }
-        try await waitUntil("publish sent") { harness.transport.sentMessages.count { self.isPublish($0) } == 1 }
-
-        XCTAssertEqual(harness.pasteboard.writes, ["hello mesh"])
-        XCTAssertEqual(harness.target.log, ["delete"])
-        XCTAssertEqual(harness.statuses.last, .copy(.cut, .sending))
-        XCTAssertEqual(harness.statuses.last?.text, "Cut to iPhone. Sending to ClipMesh…")
-
-        harness.transport.enqueue(try Self.accepted(for: harness.transport))
-        await cut.value
-        XCTAssertEqual(harness.statuses.last?.text, "Cut to iPhone and ClipMesh")
+    func testCutRefusesAndChangesNothing() async throws {
+        let long = String(repeating: "Words keep the selection long enough to test. ", count: 40)
+        // Short, an under-report (the first 79 characters of a longer
+        // selection) and repeated text all look the same to the keyboard.
+        for selection in ["hello mesh", String(long.prefix(79)), long] {
+            let harness = try Harness(selection: selection)
+            harness.actions.cut()
+            XCTAssertTrue(harness.pasteboard.writes.isEmpty)
+            XCTAssertTrue(harness.target.log.isEmpty)
+            XCTAssertTrue(harness.transport.openedEndpoints.isEmpty)
+            XCTAssertEqual(harness.statuses, [.cutRefused])
+            XCTAssertEqual(harness.statuses.last?.text,
+                           "Didn't cut: couldn't confirm the whole selection. Copy still works.")
+        }
     }
 
-    func testCopyLeavesTheFieldAlone() async throws {
+    func testCopyLeavesTheFieldAloneAndStatesHowMuchItCopied() async throws {
         let harness = try Harness(selection: "hello mesh")
         let copy = Task { await harness.actions.copy() }
         try await waitUntil("publish sent") { harness.transport.sentMessages.count { self.isPublish($0) } == 1 }
+        XCTAssertEqual(harness.statuses.last?.text,
+                       "Copied 10 characters to iPhone. Sending to ClipMesh… This may be only part of your selection, or differ in spacing.")
         harness.transport.enqueue(try Self.accepted(for: harness.transport))
         await copy.value
         XCTAssertEqual(harness.pasteboard.writes, ["hello mesh"])
         XCTAssertTrue(harness.target.log.isEmpty)
-        XCTAssertEqual(harness.statuses.last?.text, "Copied to iPhone and ClipMesh")
+        XCTAssertEqual(harness.statuses.last, .copy(characters: 10, .confirmed))
+        XCTAssertEqual(harness.statuses.last?.text,
+                       "Copied 10 characters to iPhone and ClipMesh. This may be only part of your selection, or differ in spacing.")
+    }
+
+    func testCopyCountsCharactersAsTheUserSeesThem() async throws {
+        let text = "a👩‍👩‍👧\té\n"
+        let harness = try Harness(selection: text, hasEndpoint: false)
+        await harness.actions.copy()
+        XCTAssertEqual(harness.pasteboard.writes, [text])
+        XCTAssertEqual(harness.statuses.last, .copy(characters: 5, .notSetUp))
+        XCTAssertTrue(KeyboardStatus.copy(characters: 1, .confirmed).text.hasPrefix("Copied 1 character to"))
     }
 
     func testNoSelectionChangesNothing() async throws {
         for selection in [nil, ""] as [String?] {
             let harness = try Harness(selection: selection)
-            await harness.actions.cut()
+            harness.actions.cut()
             await harness.actions.copy()
             XCTAssertTrue(harness.pasteboard.writes.isEmpty)
             XCTAssertTrue(harness.target.log.isEmpty)
             XCTAssertTrue(harness.transport.openedEndpoints.isEmpty)
-            XCTAssertEqual(harness.statuses.last?.text, "No text selected")
+            XCTAssertEqual(harness.statuses, [.noSelection, .noSelection])
+            XCTAssertEqual(harness.statuses.last?.text, "No selected text shared with the keyboard")
         }
     }
 
     func testWithoutFullAccessNoKeyChangesAnything() async throws {
         let harness = try Harness(selection: "secret", fullAccess: false)
-        await harness.actions.cut()
+        harness.actions.cut()
         await harness.actions.copy()
         await harness.actions.paste()
         XCTAssertTrue(harness.pasteboard.writes.isEmpty)
@@ -56,10 +71,10 @@ final class KeyboardActionsTests: XCTestCase {
     func testFailedClipboardWriteKeepsTheSelectionAndSendsNothing() async throws {
         let harness = try Harness(selection: "keep me")
         harness.pasteboard.succeeds = false
-        await harness.actions.cut()
+        await harness.actions.copy()
         XCTAssertTrue(harness.target.log.isEmpty)
         XCTAssertTrue(harness.transport.openedEndpoints.isEmpty)
-        XCTAssertEqual(harness.statuses.last, .iPhoneWriteFailed(.cut))
+        XCTAssertEqual(harness.statuses.last, .iPhoneWriteFailed)
     }
 
     func testWithoutAHubURLCopyStillWritesTheClipboard() async throws {
@@ -67,7 +82,7 @@ final class KeyboardActionsTests: XCTestCase {
         await harness.actions.copy()
         XCTAssertEqual(harness.pasteboard.writes, ["offline"])
         XCTAssertTrue(harness.transport.openedEndpoints.isEmpty)
-        XCTAssertEqual(harness.statuses.last?.text, "Copied to iPhone. Set up ClipMesh in the app first.")
+        XCTAssertEqual(harness.statuses.last?.text, "Copied 7 characters to iPhone. Set up ClipMesh in the app first. This may be only part of your selection, or differ in spacing.")
 
         await harness.actions.paste()
         XCTAssertTrue(harness.target.log.isEmpty)
@@ -115,10 +130,12 @@ final class KeyboardActionsTests: XCTestCase {
         let outcomes: [KeyboardCopyOutcome] = [
             .sending, .confirmed, .unconfirmed, .unreachable, .refused(.payloadTooLarge), .busy, .notSetUp,
         ]
-        let texts = outcomes.map { KeyboardStatus.copy(.copy, $0).text }
+        let texts = outcomes.map { KeyboardStatus.copy(characters: 79, $0).text }
         XCTAssertEqual(Set(texts).count, outcomes.count)
-        XCTAssertEqual(KeyboardStatus.copy(.copy, .refused(.payloadTooLarge)).text,
-                       "Copied to iPhone. ClipMesh refused it (too large).")
+        XCTAssertTrue(texts.allSatisfy { $0.hasPrefix("Copied 79 characters to iPhone") })
+        XCTAssertTrue(texts.allSatisfy { $0.hasSuffix(" This may be only part of your selection, or differ in spacing.") })
+        XCTAssertEqual(KeyboardStatus.copy(characters: 79, .refused(.payloadTooLarge)).text,
+                       "Copied 79 characters to iPhone. ClipMesh refused it (too large). This may be only part of your selection, or differ in spacing.")
     }
 
     // MARK: - Support
@@ -231,10 +248,6 @@ private final class FakeTextTarget: KeyboardTextTarget {
 
     init(selection: String?) {
         selectedText = selection
-    }
-
-    func deleteBackward() {
-        log.append("delete")
     }
 
     func insertText(_ text: String) {

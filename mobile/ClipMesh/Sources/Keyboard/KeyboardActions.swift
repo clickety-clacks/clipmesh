@@ -4,7 +4,6 @@ import Foundation
 @MainActor
 protocol KeyboardTextTarget: AnyObject {
     var selectedText: String? { get }
-    func deleteBackward()
     func insertText(_ text: String)
 }
 
@@ -52,12 +51,21 @@ final class KeyboardActions {
         currentTap = nil
     }
 
-    func copy() async {
-        await copyOrCut(.copy)
-    }
-
-    func cut() async {
-        await copyOrCut(.cut)
+    /// Refuses whenever there is reported text. iOS gives a keyboard no
+    /// selection length or range, so nothing confirms that the reported text
+    /// is the whole selection, and Cut must never remove text it did not copy
+    /// in full. It changes neither clipboard and sends nothing.
+    func cut() {
+        _ = beginTap()
+        guard hasFullAccess() else {
+            onStatus(.fullAccessNeeded)
+            return
+        }
+        guard let text = target.selectedText, !text.isEmpty else {
+            onStatus(.noSelection)
+            return
+        }
+        onStatus(.cutRefused)
     }
 
     func paste() async {
@@ -84,7 +92,7 @@ final class KeyboardActions {
         onStatus(.paste(outcome))
     }
 
-    private func copyOrCut(_ kind: KeyboardStatus.CopyKind) async {
+    func copy() async {
         let tap = beginTap()
         guard hasFullAccess() else {
             onStatus(.fullAccessNeeded)
@@ -95,18 +103,15 @@ final class KeyboardActions {
             return
         }
         guard pasteboard.write(text) else {
-            onStatus(.iPhoneWriteFailed(kind))
+            onStatus(.iPhoneWriteFailed)
             return
         }
-        if kind == .cut {
-            // With a selection, deleteBackward removes exactly the selection.
-            target.deleteBackward()
-        }
+        let characters = text.count
         guard let endpoint = loadEndpoint() else {
-            onStatus(.copy(kind, .notSetUp))
+            onStatus(.copy(characters: characters, .notSetUp))
             return
         }
-        onStatus(.copy(kind, .sending))
+        onStatus(.copy(characters: characters, .sending))
         let hub = makeTap(endpoint)
         currentTap = hub
         let result = await hub.publish(text)
@@ -114,7 +119,7 @@ final class KeyboardActions {
             return
         }
         currentTap = nil
-        onStatus(.copy(kind, outcome))
+        onStatus(.copy(characters: characters, outcome))
     }
 
     private func beginTap() -> Int {

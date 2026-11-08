@@ -1,15 +1,20 @@
 import XCTest
 import UIKit
 
-/// AS2: when the keyboard reads a non-empty selection, it is the whole
-/// selection. Selects a long multi-paragraph passage in another app, taps
-/// Copy, and checks the clipboard against the passage by pasting it back.
+/// R3 and R4 against real host fields: selects a long passage in another app,
+/// then checks that Copy states how much it copied, that Cut removes nothing
+/// and leaves both clipboards alone, and that Paste inserts what Copy sent.
+/// iOS reports only part of a long selection to a keyboard, and nothing from
+/// a Safari text area, so the checks do not expect the whole selection.
 ///
 /// Turns on the ClipMesh keyboard and Full Access in Settings, so it runs only
 /// when `CLIPMESH_TEST_KEYBOARD=1` and a dedicated test hub are supplied.
 @MainActor
 final class KeyboardSelectionUITests: XCTestCase {
     private let sentinel = "clipboard before the keyboard tap"
+    private let caveat = " This may be only part of your selection, or differ in spacing."
+    private let cutRefused = "Didn't cut: couldn't confirm the whole selection. Copy still works."
+    private let noSelection = "No selected text shared with the keyboard"
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -23,27 +28,60 @@ final class KeyboardSelectionUITests: XCTestCase {
         }
     }
 
-    func testCopyTakesTheWholeSelectionInANativeTextField() throws {
+    /// R3 long Copy, long Cut and Paste, in a native multi-line field.
+    func testNativeTextFieldCopyStatesItsLengthAndCutRefuses() throws {
         try prepareKeyboard()
         let passage = Self.passage(label: "native")
-        let contacts = XCUIApplication(bundleIdentifier: "com.apple.MobileAddressBook")
-        contacts.launch()
-        // Add sits in the navigation bar or, on newer systems, beside Search.
-        let add = contacts.buttons.matching(NSPredicate(format: "identifier == 'Add' OR label ==[c] 'Add'")).firstMatch
-        XCTAssertTrue(add.waitForExistence(timeout: 10), contacts.debugDescription)
-        add.tap()
-        let notes = contacts.textViews["Notes"].firstMatch
-        XCTAssertTrue(notes.waitForExistence(timeout: 10), contacts.debugDescription)
-        // The new contact form is a sheet; swipe the form, not the app.
-        scrollTo(notes, in: contacts, swiping: contacts.tables.firstMatch)
-        notes.tap()
-        UIPasteboard.general.string = passage
+        let (contacts, notes) = try nativeNotesField(holding: passage)
+        UIPasteboard.general.string = sentinel
+        menu("Select All", in: contacts, on: notes)
+        let keyboard = try switchToClipMeshKeyboard(in: contacts)
+
+        keyboard.buttons["keyboard.copy"].tap()
+        let status = waitForStatus(matching: "Copied [0-9,]+ characters? to iPhone and ClipMesh\\.\(NSRegularExpression.escapedPattern(for: caveat))",
+                                   in: keyboard)
+        let copied = try XCTUnwrap(Int(status.split(separator: " ")[1].replacing(",", with: "")))
+        XCTAssertEqual(notes.value as? String, passage, "Copy changed the field")
+
+        UIPasteboard.general.string = sentinel
+        keyboard.buttons["keyboard.cut"].tap()
+        waitForStatus(cutRefused, in: keyboard)
+        XCTAssertEqual(notes.value as? String, passage, "Cut removed text")
+        print("KEYBOARD_R3 app=native passage=\(passage.count) copied=\(copied) cut=refused field=unchanged")
+
+        // Cut left the selection whole, and pasting the iPhone clipboard over
+        // it shows Cut did not write the clipboard.
         menu("Paste", in: contacts, on: notes)
-        XCTAssertEqual(notes.value as? String, passage)
-        try checkCopyCutAndPaste(passage, field: notes, app: contacts)
+        XCTAssertEqual(notes.value as? String, sentinel, "Cut changed the iPhone clipboard or the selection")
+
+        // The newest ClipMesh clip is what Copy reported, at the length it stated.
+        menu("Select All", in: contacts, on: notes)
+        keyboard.buttons["keyboard.paste"].tap()
+        waitForStatus("Pasted from ClipMesh", in: keyboard)
+        let pasted = notes.value as? String ?? ""
+        XCTAssertEqual(pasted.count, copied, "ClipMesh's newest clip is not the text Copy reported")
+        XCTAssertTrue(passage.hasPrefix(String(pasted.prefix(20))), "ClipMesh's newest clip is not from the selection")
+        print("KEYBOARD_R3 app=native paste=newest-clip characters=\(pasted.count)")
     }
 
-    func testCopyTakesTheWholeSelectionInASafariTextArea() throws {
+    /// R3 repeated text: Cut refuses whatever the selection repeats.
+    func testCutRefusesRepeatedTextInANativeTextField() throws {
+        try prepareKeyboard()
+        let passage = String(repeating: "Words keep the selection long enough to test. ", count: 40)
+        let (contacts, notes) = try nativeNotesField(holding: passage)
+        UIPasteboard.general.string = sentinel
+        menu("Select All", in: contacts, on: notes)
+        let keyboard = try switchToClipMeshKeyboard(in: contacts)
+        keyboard.buttons["keyboard.cut"].tap()
+        waitForStatus(cutRefused, in: keyboard)
+        XCTAssertEqual(notes.value as? String, passage, "Cut removed text")
+        menu("Paste", in: contacts, on: notes)
+        XCTAssertEqual(notes.value as? String, sentinel, "Cut changed the iPhone clipboard or the selection")
+        print("KEYBOARD_R3 app=native-repeated passage=\(passage.count) cut=refused field=unchanged clipboard=unchanged")
+    }
+
+    /// R4: a Safari text area shares no selection with the keyboard.
+    func testSafariTextAreaSharesNoSelection() throws {
         try prepareKeyboard()
         let passage = Self.passage(label: "web")
         let page = "<meta name=viewport content='width=device-width'>"
@@ -57,41 +95,40 @@ final class KeyboardSelectionUITests: XCTestCase {
         XCTAssertTrue(area.waitForExistence(timeout: 20), safari.debugDescription)
         area.tap()
         XCTAssertEqual(area.value as? String, passage)
-        try checkCopyCutAndPaste(passage, field: area, app: safari)
+
+        UIPasteboard.general.string = sentinel
+        menu("Select All", in: safari, on: area)
+        let keyboard = try switchToClipMeshKeyboard(in: safari)
+        keyboard.buttons["keyboard.cut"].tap()
+        waitForStatus(noSelection, in: keyboard)
+        keyboard.buttons["keyboard.copy"].tap()
+        waitForStatus(noSelection, in: keyboard)
+        XCTAssertEqual(area.value as? String, passage, "Cut or Copy changed the text area")
+        menu("Paste", in: safari, on: area)
+        XCTAssertEqual(area.value as? String, sentinel, "Cut or Copy changed the iPhone clipboard")
+        print("KEYBOARD_R4 app=safari passage=\(passage.count) cut=no-selection copy=no-selection clipboard=unchanged")
     }
 
     // MARK: - Steps
 
-    /// Copy, then paste the clipboard over the selection; Cut, then paste it
-    /// into the emptied field; then the keyboard's Paste from ClipMesh. Each
-    /// leaves the field equal to the passage only if the keyboard took the
-    /// whole selection.
-    private func checkCopyCutAndPaste(_ passage: String, field: XCUIElement, app: XCUIApplication) throws {
-        UIPasteboard.general.string = sentinel
-        menu("Select All", in: app, on: field)
-        let keyboard = try switchToClipMeshKeyboard(in: app)
-        keyboard.buttons["keyboard.copy"].tap()
-        waitForStatus("Copied to iPhone and ClipMesh", in: keyboard)
-        // Copy leaves the whole passage selected, so the menu has no Select All.
-        // Pasting over it gives back the passage only if Copy took all of it.
-        menu("Paste", in: app, on: field)
-        XCTAssertEqual(field.value as? String, passage, "Copy put something other than the selection on the clipboard")
-        print("KEYBOARD_AS2 copy app=\(app.identifier) characters=\(passage.count) clipboard=whole-selection")
-
-        UIPasteboard.general.string = sentinel
-        menu("Select All", in: app, on: field)
-        keyboard.buttons["keyboard.cut"].tap()
-        waitForStatus("Cut to iPhone and ClipMesh", in: keyboard)
-        XCTAssertNotEqual(field.value as? String, passage)
-        XCTAssertFalse((field.value as? String ?? "").contains("paragraph"), "Cut left part of the selection behind")
-        menu("Paste", in: app, on: field)
-        XCTAssertEqual(field.value as? String, passage, "Cut put something other than the selection on the clipboard")
-
-        menu("Select All", in: app, on: field)
-        keyboard.buttons["keyboard.paste"].tap()
-        waitForStatus("Pasted from ClipMesh", in: keyboard)
-        XCTAssertEqual(field.value as? String, passage, "ClipMesh's newest clip differs from the selection")
-        print("KEYBOARD_AS2 cut-paste app=\(app.identifier) characters=\(passage.count) hub=whole-selection")
+    /// A new contact's Notes field in Contacts, holding `text`.
+    private func nativeNotesField(holding text: String) throws -> (XCUIApplication, XCUIElement) {
+        let contacts = XCUIApplication(bundleIdentifier: "com.apple.MobileAddressBook")
+        contacts.terminate()
+        contacts.launch()
+        // Add sits in the navigation bar or, on newer systems, beside Search.
+        let add = contacts.buttons.matching(NSPredicate(format: "identifier == 'Add' OR label ==[c] 'Add'")).firstMatch
+        XCTAssertTrue(add.waitForExistence(timeout: 10), contacts.debugDescription)
+        add.tap()
+        let notes = contacts.textViews["Notes"].firstMatch
+        XCTAssertTrue(notes.waitForExistence(timeout: 10), contacts.debugDescription)
+        // The new contact form is a sheet; swipe the form, not the app.
+        scrollTo(notes, in: contacts, swiping: contacts.tables.firstMatch)
+        notes.tap()
+        UIPasteboard.general.string = text
+        menu("Paste", in: contacts, on: notes)
+        XCTAssertEqual(notes.value as? String, text)
+        return (contacts, notes)
     }
 
     /// Saves the test hub URL in the app, then adds the keyboard and allows
@@ -159,11 +196,21 @@ final class KeyboardSelectionUITests: XCTestCase {
     }
 
     private func waitForStatus(_ text: String, in keyboard: XCUIElement) {
+        wait(for: NSPredicate(format: "label == %@", text), described: text, in: keyboard)
+    }
+
+    @discardableResult
+    private func waitForStatus(matching pattern: String, in keyboard: XCUIElement) -> String {
+        wait(for: NSPredicate(format: "label MATCHES %@", pattern), described: pattern, in: keyboard)
+    }
+
+    @discardableResult
+    private func wait(for predicate: NSPredicate, described: String, in keyboard: XCUIElement) -> String {
         let status = keyboard.staticTexts["keyboard.status"]
-        let predicate = NSPredicate(format: "label == %@", text)
         let met = XCTNSPredicateExpectation(predicate: predicate, object: status)
         XCTAssertEqual(XCTWaiter().wait(for: [met], timeout: 15), .completed,
-                       "status read \(status.exists ? status.label : "nothing"), wanted \(text)")
+                       "status read \(status.exists ? status.label : "nothing"), wanted \(described)")
+        return status.label
     }
 
     /// Opens the field's edit menu and chooses an item. For Select All, a tap
