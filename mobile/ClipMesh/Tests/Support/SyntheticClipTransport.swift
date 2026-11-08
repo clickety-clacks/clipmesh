@@ -7,6 +7,9 @@ final class SyntheticClipTransport: ClipTransport {
     private(set) var sentMessages: [Data] = []
     private(set) var isWaitingForInput = false
     private(set) var pingCount = 0
+    private(set) var closeCount = 0
+    /// What a refused WebSocket upgrade would report, such as 429.
+    var refusedUpgradeStatusCode: Int?
     /// When false, pings fail as they would on a connection the hub dropped.
     var answersPings = true
     private var incoming: [Data]
@@ -42,6 +45,7 @@ final class SyntheticClipTransport: ClipTransport {
     }
 
     func close() {
+        closeCount += 1
         isWaitingForInput = false
         waiter?.resume(throwing: CancellationError())
         waiter = nil

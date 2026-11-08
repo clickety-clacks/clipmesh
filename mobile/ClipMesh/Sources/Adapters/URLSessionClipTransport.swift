@@ -70,6 +70,16 @@ final class URLSessionClipTransport: ClipTransport {
         }
     }
 
+    var refusedUpgradeStatusCode: Int? {
+        guard !validatedUpgrade,
+              let status = (task?.response as? HTTPURLResponse)?.statusCode,
+              status != 101
+        else {
+            return nil
+        }
+        return status
+    }
+
     func close() {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
